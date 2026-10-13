@@ -8,20 +8,39 @@ import subprocess
 import tempfile
 import cv2
 import numpy as np
-import shutil  # noqa: F401
+import shutil
 from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import yt_dlp
 
 app = FastAPI()
 
+# The SPA is served by Vercel while this API runs on a separate host, so every
+# browser request is cross-origin. CORS_ALLOW_ORIGINS is a comma-separated list
+# of exact origins; it defaults to localhost only, never to "*", because the API
+# accepts uploads and spends the operator's bandwidth.
+_allowed = os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:8443")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _allowed.split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
 JOBS = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Serverless filesystems are read-only outside /tmp, so scratch space (video
-# downloads, ffmpeg temp files) has to live in a writable directory.
-if os.environ.get("VERCEL"):
+# Where downloaded sources and generated clips live. A container host mounts a
+# volume here so artifacts survive restarts; Vercel has no writable disk outside
+# /tmp, hence the tempfile fallback for that (unsupported) target.
+_dl = os.environ.get("SKIMREEL_DOWNLOAD_DIR", "").strip()
+if _dl:
+    DOWNLOAD_DIR = _dl
+elif os.environ.get("VERCEL"):
     DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "skimreel-downloads")
 else:
     DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
@@ -112,6 +131,20 @@ def base_ydl_opts() -> dict:
         opts['impersonate'] = impersonate
 
     return opts
+
+
+@app.get("/api/health")
+def health():
+    """Liveness probe for the container host. Also reports whether yt-dlp is
+    likely to pass YouTube's bot check, which is the usual reason for a
+    "deployed but every link fails" report."""
+    return {
+        "ok": True,
+        "ffmpeg": bool(shutil.which("ffmpeg")),
+        "cookies": bool(os.environ.get("YTDLP_COOKIES_FILE", "").strip()),
+        "download_dir_writable": os.access(DOWNLOAD_DIR, os.W_OK),
+    }
+
 
 @app.post("/api/analyze")
 async def analyze(

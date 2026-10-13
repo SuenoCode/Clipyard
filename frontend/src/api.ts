@@ -1,4 +1,8 @@
-const API_BASE = ""
+// Empty string keeps requests same-origin, which is what the Vite dev server
+// proxy and a Vercel rewrite both expect. Set VITE_API_BASE to the deployed API
+// origin (e.g. https://api.skimreel.dev) when the SPA and API live on different
+// hosts.
+const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "")
 
 export interface Moment {
   start: number

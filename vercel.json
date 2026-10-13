@@ -1,28 +1,15 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
-    "app": {
-      "root": ".",
-      "framework": "fastapi",
-      "functions": {
-        "app.py": {
-          "excludeFiles": "{frontend/**,downloads/**,web/**,.git/**,*.zip}"
-        }
-      }
-    },
     "frontend": {
       "root": "frontend",
       "framework": "vite",
-      "outputDirectory": "dist"
+      "buildCommand": "npm run build",
+      "outputDirectory": "dist",
+      "installCommand": "npm install"
     }
   },
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": {
-        "service": "app"
-      }
-    },
     {
       "source": "/(.*)",
       "destination": {

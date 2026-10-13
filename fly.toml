@@ -1,0 +1,50 @@
+# SkimReel API on Fly.io.
+#
+#   fly launch --no-deploy --copy-config   (first time)
+#   fly volumes create skimreel_data --size 10 --region ord
+#   fly secrets set YTDLP_COOKIES_FILE=/data/cookies.txt
+#   fly deploy
+#
+# Adjust app/region/primary_region to match your own Fly account.
+
+app = "skimreel-api"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  SKIMREEL_DOWNLOAD_DIR = "/data"
+  # Allow the Vercel-hosted SPA. Replace with your real domain, comma-separated.
+  CORS_ALLOW_ORIGINS = "http://localhost:5173,http://localhost:8443"
+
+[[mounts]]
+  source = "skimreel_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Video cutting and transcription can run long. The default 60s ceiling is not
+  # enough for a Whisper pass over a long clip.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 10
+    hard_limit = 20
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/api/health"
+
+[[vm]]
+  # Video analysis is CPU-bound. Size 2 shared-cpu VMs are the cheapest tier
+  # that handles a 1080p OpenCV pass without timing out.
+  size = "shared-cpu-2x"
+  memory = "2gb"
