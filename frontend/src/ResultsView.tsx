@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef } from "react"
 import Icon from "./Icon"
+import PreviewPlayer from "./PreviewPlayer"
 import {
   Moment,
   Transcript,
   clipUrl,
-  previewUrl,
   transcriptUrl,
   deepLink,
   fmtTime,
@@ -203,27 +203,11 @@ export default function ResultsView({
                 </div>
 
                 {isPreviewing ? (
-                  <div className="preview-wrap">
-                    <video
-                      className="preview-player"
-                      src={previewUrl(jobId, i)}
-                      controls
-                      autoPlay
-                      // Browsers block autoplay for media with an audio track
-                      // unless it is muted. Start muted so playback actually
-                      // begins, and leave it to the native controls to unmute.
-                      muted
-                      playsInline
-                      preload="metadata"
-                    />
-                    <button
-                      className="preview-close"
-                      onClick={() => setPreviews((p) => ({ ...p, [i]: false }))}
-                      aria-label="Close preview"
-                    >
-                      <Icon name="close" size={14} />
-                    </button>
-                  </div>
+                  <PreviewPlayer
+                    jobId={jobId}
+                    idx={i}
+                    onClose={() => setPreviews((p) => ({ ...p, [i]: false }))}
+                  />
                 ) : (
                   <button
                     className="preview-open"

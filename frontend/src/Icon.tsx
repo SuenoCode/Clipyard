@@ -1,4 +1,4 @@
-export type IconName = "upload" | "link" | "arrow" | "film" | "check" | "play" | "download" | "captions" | "close" | "copy" | "spinner"
+export type IconName = "upload" | "link" | "arrow" | "film" | "check" | "play" | "download" | "captions" | "close" | "copy" | "spinner" | "volume" | "mute"
 
 export default function Icon({
   name,
@@ -58,6 +58,19 @@ export default function Icon({
         <>
           <rect x="2.5" y="5" width="19" height="14" rx="2.5" />
           <path d="M10 10.2a2.2 2.2 0 1 0 0 3.6M18 10.2a2.2 2.2 0 1 0 0 3.6" />
+        </>
+      )}
+      {name === "volume" && (
+        <>
+          <path d="M11 5 6 9H2v6h4l5 4z" />
+          <path d="M15.5 8.5a4.5 4.5 0 0 1 0 7" />
+          <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+        </>
+      )}
+      {name === "mute" && (
+        <>
+          <path d="M11 5 6 9H2v6h4l5 4z" />
+          <path d="m16 9.5 6 5m0-5-6 5" />
         </>
       )}
       {name === "close" && <path d="M6 6l12 12M18 6 6 18" />}
