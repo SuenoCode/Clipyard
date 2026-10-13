@@ -47,6 +47,54 @@ elif os.environ.get("VERCEL"):
 else:
     DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 
+# Cloud sync clients hold freshly written files open while they upload, which makes
+# yt-dlp's final rename fail with WinError 32 on Windows. The download then dies
+# before merging, leaving per-format fragments behind, and a clip cut from one of
+# those comes out silent - while the request still returns 200. Detected at boot so
+# the cause is named before a user waits on it.
+SYNC_DIR_MARKERS = (
+    ("OneDrive", "OneDrive"),
+    ("Dropbox", "Dropbox"),
+    ("Google Drive", "Google Drive"),
+    ("GoogleDrive", "Google Drive"),
+    ("iCloud", "iCloud"),
+)
+
+
+def _sync_provider(path: str):
+    """Name the sync service owning this path, or None if it is not synced.
+
+    OneDrive exposes its root as an environment variable, so check that first.
+    The rest fall back to a substring test, which is less precise but catches the
+    common 'Dropbox' or 'Google Drive' folder layouts.
+    """
+    try:
+        resolved = os.path.abspath(path)
+    except Exception:
+        return None
+
+    root = os.environ.get("OneDrive", "").strip()
+    if root and os.path.abspath(root) in os.path.normcase(resolved):
+        return "OneDrive"
+
+    lowered = os.path.normcase(resolved)
+    for marker, name in SYNC_DIR_MARKERS:
+        if os.path.normcase(marker) in lowered:
+            return name
+    return None
+
+
+SYNC_PROVIDER = _sync_provider(DOWNLOAD_DIR)
+if SYNC_PROVIDER:
+    print(
+        f"[skimreel] WARNING: the downloads directory is inside a {SYNC_PROVIDER}"
+        f"-synced folder ({DOWNLOAD_DIR}). The sync client locks files while it"
+        " uploads them, so yt-dlp's final rename fails with WinError 32, the"
+        " download never merges, and clips come out with no audio track. Set"
+        " SKIMREEL_DOWNLOAD_DIR to a local path outside the sync root.",
+        file=sys.stderr,
+    )
+
 # Vite builds the SPA into frontend/dist. On Vercel the CDN serves it from the
 # frontend service, so this only matters for local `uvicorn app.py` runs.
 WEB_DIR = os.path.join(BASE_DIR, "frontend", "dist")
@@ -241,6 +289,55 @@ def probe_duration(path: str) -> float:
     return 0.0
 
 
+def _has_playable_video(path: str) -> bool:
+    """True if the file has a video stream that is complete enough to cut from.
+
+    Used to reject a source recovered by the filename glob in ensure_source,
+    which by definition has not been through this code path and may be a
+    fragment or a truncated download.
+
+    Three checks, because neither one alone is sufficient. Duration is useless on
+    its own: an interrupted faststart MP4 still carries a full moov atom in its
+    first few megabytes, so ffprobe cheerfully reports the complete runtime of a
+    file that is 1.7% downloaded. The size check is what actually catches that.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type,duration,bit_rate",
+             "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+    except Exception:
+        return False
+
+    fields = res.stdout.decode("utf-8", "ignore").strip().split(",")
+    if not fields or fields[0] != "video":
+        return False
+
+    try:
+        duration = float(fields[1]) if len(fields) > 1 and fields[1] else 0.0
+        bit_rate = int(fields[2]) if len(fields) > 2 and fields[2] else 0
+    except ValueError:
+        return False
+
+    if duration <= 0:
+        return False
+
+    # A truncated file is far smaller than duration x bitrate. The tolerance is
+    # generous because container overhead and VBR make the estimate rough in both
+    # directions; a genuinely complete file measures well above 1.0.
+    if bit_rate > 0:
+        expected_bytes = duration * bit_rate / 8
+        if expected_bytes > 0 and os.path.getsize(path) < expected_bytes * 0.9:
+            return False
+
+    return True
+
+
 def open_capture(path: str):
     """Open a video for frame analysis, transcoding as a last resort.
 
@@ -304,6 +401,7 @@ def health():
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "cookies": _cookies_configured(),
         "download_dir_writable": os.access(DOWNLOAD_DIR, os.W_OK),
+        "download_dir_synced": SYNC_PROVIDER,
     }
 
 
@@ -455,6 +553,16 @@ def ensure_source(job_id: str) -> str:
             # were the source.
             if "_preview" in f or "_clip_" in f:
                 continue
+            # yt-dlp downloads each format as its own fragment and merges
+            # afterwards, so a download that dies before the merge leaves these
+            # behind: {job}_source.f137.mp4 is the video-only stream and
+            # {job}_source.f251.webm is the audio-only one. They are named with a
+            # real video extension, so the suffix test below does not catch them.
+            # Handing f137 to the cutter yields a 200 and a completely silent clip,
+            # which is the worst possible outcome. yt-dlp removes them on success,
+            # so their presence means the download did not complete.
+            if re.search(r"\.f\d{3}\.", f) or f.endswith(".part"):
+                continue
             if f.startswith(job_id) and f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts')):
                 found = os.path.join(DOWNLOAD_DIR, f)
                 break
@@ -463,6 +571,24 @@ def ensure_source(job_id: str) -> str:
 
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Failed to download source video")
+
+    # Anything recovered by the glob is unverified, so probe it before the clip
+    # cutter trusts it. A truncated or wrong-stream file that decodes to something
+    # still produces a 200 with broken output; failing here names the real problem.
+    # Audio is deliberately not required - a genuinely silent source is valid - but
+    # the audio-only fragment is already excluded by the video-stream check.
+    if not _has_playable_video(video_path):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The downloaded source file is not a usable video (no video "
+                "stream, or it is truncated). This usually means the download was "
+                "interrupted - commonly because the downloads folder is inside a "
+                "cloud-synced location like OneDrive, which locks freshly written "
+                "files and makes yt-dlp's rename fail. Set SKIMREEL_DOWNLOAD_DIR "
+                "to a local path outside OneDrive and retry."
+            ),
+        )
 
     # Report the resolution actually obtained. Format selection is a ceiling, so a
     # 1080p request against a 360p source legitimately yields 360p; surfacing the
