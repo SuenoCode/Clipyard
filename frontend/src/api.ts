@@ -22,7 +22,7 @@ export const API_ORIGIN = API_BASE || window.location.origin
  * the API at all - no API host configured means this hits the SPA host, which
  * answers 404 with HTML - the generic "Analysis failed" hides the real cause.
  */
-async function describeFailure(
+export async function describeFailure(
   res: Response,
   fallback: string,
 ): Promise<string> {
