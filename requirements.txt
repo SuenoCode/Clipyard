@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+yt-dlp
+numpy
+opencv-python
+requests
+python-multipart
+pysrt
+# Transcription engine. Optional: ClipForge runs without it and falls back to
+# captions shipped with the source video, then tells the user how to install it.
+faster-whisper
