@@ -209,6 +209,10 @@ export default function ResultsView({
                       src={previewUrl(jobId, i)}
                       controls
                       autoPlay
+                      // Browsers block autoplay for media with an audio track
+                      // unless it is muted. Start muted so playback actually
+                      // begins, and leave it to the native controls to unmute.
+                      muted
                       playsInline
                       preload="metadata"
                     />

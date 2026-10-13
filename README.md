@@ -104,15 +104,33 @@ uvicorn worker would not see jobs started by the first.
 
 ## Deploying the frontend to Vercel
 
-Set one project environment variable:
+### `VITE_API_BASE` is required, not optional
+
+This is the single most common reason a Vercel deployment fails while local
+works. Vercel serves only the SPA — there is no API there. If `VITE_API_BASE`
+is unset, the browser posts to its own origin, Vercel answers `404` with the
+SPA's HTML, and every analysis reports a failure.
+
+Set it in the Vercel project settings (not in a committed `.env`):
 
 ```
 VITE_API_BASE=https://<your-app>.fly.dev
 ```
 
-Vite inlines `VITE_API_BASE` at build time, so redeploy after changing it. The
-`CORS_ALLOW_ORIGINS` value on Fly must include the Vercel domain exactly,
+Vite inlines this at **build** time, so changing it requires a redeploy, not just
+a restart. Confirm it took effect by checking the deployed bundle contains your
+API host, or by watching the network tab: `/api/analyze` must go to the Fly
+domain, not to the Vercel one.
+
+The `CORS_ALLOW_ORIGINS` value on Fly must include the Vercel domain exactly,
 scheme included.
+
+Verify the two hosts talk to each other:
+
+```bash
+curl -i -X POST https://<your-vercel-domain>/api/analyze -F length=30
+# Expect a JSON error from the Fly API (e.g. 422 or 400), NOT an HTML 404 page.
+```
 
 Local file uploads are capped by the host's request size limit; Vercel and Fly
 both sit well below a typical video file, so large uploads will fail in

@@ -4,6 +4,49 @@
 // hosts.
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "")
 
+export const API_ORIGIN = API_BASE || window.location.origin
+
+/**
+ * Turn a non-OK response into something diagnosable.
+ *
+ * The API answers errors with JSON `{detail}`. When the request never reaches
+ * the API at all - a missing VITE_API_BASE means this hits the SPA host, which
+ * answers 404 with HTML - the generic "Analysis failed" hides the real cause.
+ */
+async function describeFailure(
+  res: Response,
+  fallback: string,
+): Promise<string> {
+  const type = res.headers.get("content-type") ?? ""
+  let body: string | null = null
+  try {
+    body = await res.text()
+  } catch {
+    /* body already consumed or unreadable */
+  }
+
+  if (type.includes("application/json") && body) {
+    try {
+      const parsed = JSON.parse(body)
+      const detail = parsed?.detail
+      if (typeof detail === "string" && detail) return detail
+      if (Array.isArray(detail) && detail[0]?.msg) return detail[0].msg
+    } catch {
+      /* fall through to the generic message */
+    }
+  }
+
+  // An HTML body means a static host answered instead of the API.
+  if (type.includes("text/html")) {
+    return (
+      `${fallback} (HTTP ${res.status} from ${res.url} returned HTML, not the API). ` +
+      "The API is probably not reachable: check that VITE_API_BASE is set in the " +
+      "Vercel project and points at the deployed backend."
+    )
+  }
+  return `${fallback} (HTTP ${res.status})`
+}
+
 export interface Moment {
   start: number
   end: number
@@ -40,13 +83,20 @@ export interface JobStatus {
 }
 
 export async function analyzeVideo(data: FormData): Promise<{ job: string }> {
-  const res = await fetch(`${API_BASE}/api/analyze`, {
-    method: "POST",
-    body: data,
-  })
+  let res: Response
+  try {
+    res = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: data })
+  } catch (cause) {
+    // Network-level failure: wrong host, blocked by CORS, or the API is down.
+    throw new Error(
+      `Could not reach the API at ${API_ORIGIN}. Check VITE_API_BASE and that ` +
+        `the backend is running and allows this origin. (${
+          cause instanceof Error ? cause.message : String(cause)
+        })`,
+    )
+  }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: "Analysis failed" }))
-    throw new Error(err.detail || "Analysis failed")
+    throw new Error(await describeFailure(res, "Analysis failed"))
   }
   return res.json()
 }
@@ -54,7 +104,9 @@ export async function analyzeVideo(data: FormData): Promise<{ job: string }> {
 export async function pollJob(jobId: string): Promise<JobStatus> {
   const res = await fetch(`${API_BASE}/api/job/${jobId}`)
   if (!res.ok) {
-    throw new Error("Failed to poll job status")
+    throw new Error(
+      await describeFailure(res, "Failed to check analysis progress"),
+    )
   }
   return res.json()
 }
@@ -79,10 +131,7 @@ export async function transcribeClip(
     method: "POST",
   })
   if (!res.ok) {
-    const err = await res
-      .json()
-      .catch(() => ({ detail: "Transcription failed" }))
-    throw new Error(err.detail || "Transcription failed")
+    throw new Error(await describeFailure(res, "Transcription failed"))
   }
   return res.json()
 }

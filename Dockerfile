@@ -22,8 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /srv
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-transcribe.txt ./
+# Transcription ships in the image: the API no longer runs on a serverless
+# platform, so there is no 500MB bundle ceiling to design around.
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-transcribe.txt
 
 COPY app.py ./
 
@@ -31,6 +33,10 @@ COPY app.py ./
 RUN mkdir -p /srv/downloads
 ENV SKIMREEL_DOWNLOAD_DIR=/srv/downloads
 VOLUME ["/srv/downloads"]
+
+# Keep the Whisper model on the volume; otherwise every cold start re-downloads
+# ~140MB before the first transcription can run.
+ENV HF_HOME=/data/huggingface
 
 EXPOSE 8080
 

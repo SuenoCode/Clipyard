@@ -590,12 +590,14 @@ def post_transcribe(job_id: str, idx: int):
                 result = None
 
         if not result:
+            # Only reachable on a local checkout that skipped the optional
+            # requirements file, or when the source has no speech at all.
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "No transcription engine available. Install one with: "
-                    "pip install -r requirements-transcribe.txt"
-                )
+                    "No speech could be transcribed from this clip. Local installs "
+                    "need the optional engine: pip install -r requirements-transcribe.txt"
+                ),
             )
 
         for seg in result["segments"]:
