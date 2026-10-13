@@ -73,7 +73,7 @@ export default function ResultsView({
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `clipyard_${idx + 1}_${fmtTime(moments[idx].start).replace(/:/g, "-")}.mp4`
+      a.download = `skimreel_${idx + 1}_${fmtTime(moments[idx].start).replace(/:/g, "-")}.mp4`
       a.click()
       URL.revokeObjectURL(url)
     } catch {
@@ -130,8 +130,8 @@ export default function ResultsView({
             <span className="status-dot" /> ANALYSIS COMPLETE
           </div>
           <div className="brand">
-            <span className="brand-script">Clip</span>
-            <span className="brand-serif">Yard</span>
+            <span className="brand-script">Skim</span>
+            <span className="brand-serif">Reel</span>
             <span className="brand-star" aria-hidden="true">
               ✳
             </span>
@@ -335,7 +335,7 @@ export default function ResultsView({
 
         <footer>
           <span>
-            CLIPYARD <span className="footer-slash">/</span> MADE FOR CREATORS,
+            SKIMREEL <span className="footer-slash">/</span> MADE FOR CREATORS,
             NOT COMPLICATIONS.
           </span>
           <span>TAKE THE RAW. MAKE IT GOLD.</span>

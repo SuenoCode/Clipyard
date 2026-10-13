@@ -34,8 +34,8 @@ export default function LoadingView({
             <span className="status-dot status-dot-pulse" /> ANALYZING
           </div>
           <div className="brand">
-            <span className="brand-script">Clip</span>
-            <span className="brand-serif">Yard</span>
+            <span className="brand-script">Skim</span>
+            <span className="brand-serif">Reel</span>
             <span className="brand-star" aria-hidden="true">
               ✳
             </span>
@@ -98,7 +98,7 @@ export default function LoadingView({
 
         <footer>
           <span>
-            CLIPYARD <span className="footer-slash">/</span> MADE FOR CREATORS,
+            SKIMREEL <span className="footer-slash">/</span> MADE FOR CREATORS,
             NOT COMPLICATIONS.
           </span>
           <span>TAKE THE RAW. MAKE IT GOLD.</span>

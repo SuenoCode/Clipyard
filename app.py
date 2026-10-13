@@ -437,7 +437,7 @@ def get_transcript_srt(job_id: str, idx: int):
     payload = JOBS[job_id].get("transcripts", {}).get(str(idx)) if job_id in JOBS else None
     if not payload:
         raise HTTPException(status_code=404, detail="No transcript yet. Run Transcribe first.")
-    srt_name = f"clipyard_{idx + 1}.srt"
+    srt_name = f"skimreel_{idx + 1}.srt"
     return Response(
         content=payload["srt"],
         media_type="application/x-subrip",
