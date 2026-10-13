@@ -18,10 +18,21 @@ import yt_dlp
 app = FastAPI()
 
 JOBS = {}
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Serverless filesystems are read-only outside /tmp, so scratch space (video
+# downloads, ffmpeg temp files) has to live in a writable directory.
+if os.environ.get("VERCEL"):
+    DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "skimreel-downloads")
+else:
+    DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+
+# Vite builds the SPA into frontend/dist. On Vercel the CDN serves it from the
+# frontend service, so this only matters for local `uvicorn app.py` runs.
+WEB_DIR = os.path.join(BASE_DIR, "frontend", "dist")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(WEB_DIR, exist_ok=True)
+if not os.environ.get("VERCEL"):
+    os.makedirs(WEB_DIR, exist_ok=True)
 
 # Per-clip work (clip cut / preview render / transcription) must not run twice
 # for the same moment when the user clicks fast, so guard each one with a lock.
@@ -629,6 +640,8 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
         j["error"] = str(e)
         j["status"] = "Error"
 
-# Serve React build (must be after all API routes)
-app.mount("/assets", StaticFiles(directory=os.path.join(WEB_DIR, "assets")), name="assets")
-app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
+# Serve the React build for local runs (must be after all API routes).
+# Skipped on Vercel: the frontend service owns static assets there.
+if not os.environ.get("VERCEL") and os.path.isdir(WEB_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(WEB_DIR, "assets")), name="assets")
+    app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")

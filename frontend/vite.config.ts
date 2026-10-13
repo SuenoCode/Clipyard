@@ -9,7 +9,7 @@ export default defineConfig(({ mode }) => {
   return {
     base: "/",
     build: {
-      outDir: "../web",
+      outDir: "dist",
       emptyOutDir: true,
       sourcemap: isDev ? "inline" : false,
       minify: !isDev,
