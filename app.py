@@ -133,6 +133,92 @@ def base_ydl_opts() -> dict:
     return opts
 
 
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv")
+
+
+def safe_upload_name(filename: str) -> str:
+    """Reduce a client-supplied filename to a safe, unique-on-disk basename.
+
+    Keeps the extension (ffmpeg and OpenCV both sniff by it) while stripping
+    directory components and anything the host filesystem may reject.
+    """
+    base = os.path.basename(str(filename or "").replace("\\", "/"))
+    base = SAFE_NAME_RE.sub("_", base).strip("._") or "upload"
+    stem, ext = os.path.splitext(base)
+    if ext.lower() not in VIDEO_EXTS:
+        ext = ".mp4"
+    return f"{stem[:80]}{ext}"
+
+
+def probe_duration(path: str) -> float:
+    """Container duration in seconds.
+
+    OpenCV reports 0 (or a wildly wrong value) for some uploads, which silently
+    skews every clip offset, so ask ffprobe first and fall back to OpenCV.
+    """
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        val = float(res.stdout.decode("utf-8", "ignore").strip())
+        if val > 0:
+            return val
+    except Exception:
+        pass
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    cap.release()
+    if fps > 0 and frames > 0:
+        return float(frames) / float(fps)
+    return 0.0
+
+
+def open_capture(path: str):
+    """Open a video for frame analysis, transcoding as a last resort.
+
+    Returns (capture, cleanup). `cleanup` removes any temporary proxy file and
+    must be called by the caller. OpenCV ships without every codec, so an upload
+    it cannot decode is re-encoded through ffmpeg before we give up.
+    """
+    cap = cv2.VideoCapture(path)
+    if cap.isOpened():
+        return cap, (lambda: None)
+
+    cap.release()
+    tmp_dir = tempfile.mkdtemp(prefix="skimreel-proxy-")
+    proxy = os.path.join(tmp_dir, "proxy.mp4")
+
+    def cleanup():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    ffmpeg_run([
+        "ffmpeg", "-y", "-v", "error", "-i", path,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", proxy,
+    ])
+
+    if not os.path.exists(proxy) or os.path.getsize(proxy) == 0:
+        cleanup()
+        raise Exception(
+            "Could not read this video. It may be corrupt or use a codec "
+            "neither OpenCV nor ffmpeg can decode."
+        )
+
+    cap = cv2.VideoCapture(proxy)
+    if not cap.isOpened():
+        cap.release()
+        cleanup()
+        raise Exception("Could not read this video. Try re-exporting it as H.264 MP4.")
+    return cap, cleanup
+
+
 @app.get("/api/health")
 def health():
     """Liveness probe for the container host. Also reports whether yt-dlp is
@@ -159,17 +245,23 @@ async def analyze(
     # Handle file upload
     video_path = None
     original_url = url
+    display_title = "Untitled"
     if file and file.filename:
-        video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_{file.filename}")
+        # The browser-supplied name is untrusted: it may carry separators or
+        # characters the filesystem rejects, and it must never escape DOWNLOAD_DIR.
+        safe_name = safe_upload_name(file.filename)
+        video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_{safe_name}")
         with open(video_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
         original_url = f"file://{video_path}"
+        # Show the name the user recognises, not the prefixed one on disk.
+        display_title = os.path.basename(str(file.filename).replace("\\", "/")) or safe_name
     
     JOBS[job_id] = {
         "done": False,
         "status": "Queued",
         "pct": 0,
-        "title": "Untitled",
+        "title": display_title,
         "moments": [],
         "error": None,
         "video_path": video_path,
@@ -587,35 +679,34 @@ def analyze_stream(video_url: str, duration: float, clip_length: float, count: i
     step = duration / N
     times = [(i + 0.5) * step for i in range(N)]
     
-    cap = cv2.VideoCapture(video_url)
-    if not cap.isOpened():
-        raise Exception("Could not open video stream for analysis")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    
-    motion_scores = []
-    for i, t in enumerate(times):
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret1, frame1 = cap.read()
-        if not ret1:
-            motion_scores.append(0.0)
-            continue
-        
-        cap.set(cv2.CAP_PROP_POS_MSEC, min(duration * 1000, (t + 0.7) * 1000))
-        ret2, frame2 = cap.read()
-        if not ret2:
-            frame2 = frame1
-            
-        f1 = cv2.resize(cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY), (64, 36))
-        f2 = cv2.resize(cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY), (64, 36))
-        diff = np.mean(np.abs(f1.astype(float) - f2.astype(float)) / 255.0)
-        motion_scores.append(float(diff))
-        
-        pct = 10 + int(70 * (i + 1) / N)
-        j["pct"] = pct
-        j["status"] = f"Analyzing... {i+1}/{N}"
-    
-    cap.release()
+    cap, cleanup = open_capture(video_url)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
+        motion_scores = []
+        for i, t in enumerate(times):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret1, frame1 = cap.read()
+            if not ret1:
+                motion_scores.append(0.0)
+                continue
+
+            cap.set(cv2.CAP_PROP_POS_MSEC, min(duration * 1000, (t + 0.7) * 1000))
+            ret2, frame2 = cap.read()
+            if not ret2:
+                frame2 = frame1
+
+            f1 = cv2.resize(cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY), (64, 36))
+            f2 = cv2.resize(cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY), (64, 36))
+            diff = np.mean(np.abs(f1.astype(float) - f2.astype(float)) / 255.0)
+            motion_scores.append(float(diff))
+
+            pct = 10 + int(70 * (i + 1) / N)
+            j["pct"] = pct
+            j["status"] = f"Analyzing... {i+1}/{N}"
+    finally:
+        cap.release()
+        cleanup()
     
     if motion_scores:
         max_m = max(motion_scores) or 1.0
@@ -669,14 +760,16 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
             if not os.path.exists(video_path):
                 raise Exception("Local video file not found")
             
-            cap = cv2.VideoCapture(video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-            duration = total_frames / fps
-            cap.release()
-            
+            duration = probe_duration(video_path)
+            if duration <= 0:
+                raise Exception(
+                    "Could not read this video's duration. It may be corrupt "
+                    "or in a format this build cannot decode."
+                )
+
             j["video_path"] = video_path
-            j["title"] = os.path.basename(video_path)
+            if not j.get("title") or j["title"] == "Untitled":
+                j["title"] = os.path.basename(video_path)
             j["duration"] = duration
         else:
             j["status"] = "Getting stream URLs..."
