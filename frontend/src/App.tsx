@@ -170,7 +170,7 @@ export default function App() {
             </div>
             <div className="brand">
               <span className="brand-script">Clip</span>
-              <span className="brand-serif">Forge</span>
+              <span className="brand-serif">Yard</span>
               <span className="brand-star" aria-hidden="true">
                 ✳
               </span>
@@ -212,7 +212,7 @@ export default function App() {
           </div>
           <footer>
             <span>
-              CLIPFORGE <span className="footer-slash">/</span> MADE FOR
+              CLIPYARD <span className="footer-slash">/</span> MADE FOR
               CREATORS, NOT COMPLICATIONS.
             </span>
             <span>TAKE THE RAW. MAKE IT GOLD.</span>
@@ -469,7 +469,7 @@ export default function App() {
         )}
         <footer>
           <span>
-            CLIPFORGE <span className="footer-slash">/</span> MADE FOR CREATORS,
+            CLIPYARD <span className="footer-slash">/</span> MADE FOR CREATORS,
             NOT COMPLICATIONS.
           </span>
           <span>TAKE THE RAW. MAKE IT GOLD.</span>

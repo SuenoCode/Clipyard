@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.DEV ? "" : "http://localhost:8000"
+const API_BASE = ""
 
 export interface Moment {
   start: number
