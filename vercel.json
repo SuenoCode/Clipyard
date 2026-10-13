@@ -3,7 +3,12 @@
   "services": {
     "app": {
       "root": ".",
-      "framework": "fastapi"
+      "framework": "fastapi",
+      "functions": {
+        "app.py": {
+          "excludeFiles": "{frontend/**,downloads/**,web/**,.git/**,*.zip}"
+        }
+      }
     },
     "frontend": {
       "root": "frontend",

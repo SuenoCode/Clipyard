@@ -8,8 +8,7 @@ import subprocess
 import tempfile
 import cv2
 import numpy as np
-import pysrt
-import shutil
+import shutil  # noqa: F401
 from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -423,7 +422,10 @@ def post_transcribe(job_id: str, idx: int):
         if not result:
             raise HTTPException(
                 status_code=503,
-                detail="No transcription engine available. Install one with: pip install faster-whisper"
+                detail=(
+                    "No transcription engine available. Install one with: "
+                    "pip install -r requirements-transcribe.txt"
+                )
             )
 
         for seg in result["segments"]:
