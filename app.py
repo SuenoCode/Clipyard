@@ -60,6 +60,59 @@ def format_str_for(quality: str) -> str:
     height = norm_quality(quality)
     return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
 
+
+# --- yt-dlp options ---------------------------------------------------------
+# YouTube answers anonymous requests from datacenter IPs with
+# "Sign in to confirm you're not a bot". Cookies are the reliable fix, so both a
+# Netscape cookies.txt path and a browser name are supported via the environment.
+
+YTDLP_CLIENTS = ["tv", "web_safari", "mweb", "web", "android"]
+
+
+def _curl_cffi_available():
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def base_ydl_opts() -> dict:
+    opts = {
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'quiet': True,
+        'no_warnings': True,
+        'retries': 3,
+        'extractor_args': {
+            'youtube': {
+                'player_client': YTDLP_CLIENTS,
+            }
+        },
+    }
+
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookies_file:
+        # Resolve a bare filename against the repo so the uvicorn process cwd
+        # does not decide whether it resolves.
+        if not os.path.isabs(cookies_file):
+            cookies_file = os.path.join(BASE_DIR, cookies_file)
+        cookies_file = os.path.abspath(cookies_file)
+        if os.path.exists(cookies_file):
+            opts['cookiefile'] = cookies_file
+
+    cookies_from_browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if cookies_from_browser and not opts.get("cookiefile"):
+        opts['cookiesfrombrowser'] = tuple(
+            part.strip() for part in cookies_from_browser.split(":")
+        )
+
+    impersonate = os.environ.get("YTDLP_IMPERSONATE", "").strip()
+    if impersonate and _curl_cffi_available():
+        opts['impersonate'] = impersonate
+
+    return opts
+
 @app.post("/api/analyze")
 async def analyze(
     url: str = Form(""),
@@ -135,15 +188,12 @@ def ensure_source(job_id: str) -> str:
 
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_source.mp4")
     if not os.path.exists(video_path):
-        ydl_opts = {
+        ydl_opts = base_ydl_opts()
+        ydl_opts.update({
             'format': format_str_for(j.get("quality", "720")),
             'outtmpl': video_path,
             'merge_output_format': 'mp4',
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-            'geo_bypass': True,
-            'nocheckcertificate': True,
-            'quiet': True,
-        }
+        })
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([original_url])
 
@@ -279,13 +329,8 @@ def _captions_from_source(job_id: str, start: float, end: float):
     if original_url.startswith("file://"):
         return None
 
-    ydl_opts = {
-        'skip_download': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'quiet': True,
-    }
+    ydl_opts = base_ydl_opts()
+    ydl_opts['skip_download'] = True
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(original_url, download=False)
@@ -468,16 +513,11 @@ def fmt_time(seconds):
     return f"{m}:{sec:02d}"
 
 def get_stream_urls(url: str, quality: str):
-    format_str = format_str_for(quality)
-
-    ydl_opts = {
-        'format': format_str,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'quiet': True,
+    ydl_opts = base_ydl_opts()
+    ydl_opts.update({
+        'format': format_str_for(quality),
         'skip_download': True,
-    }
+    })
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
