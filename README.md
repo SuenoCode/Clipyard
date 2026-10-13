@@ -102,35 +102,53 @@ download directory is writable — the three things that break silently otherwis
 Scale by adding machines, not workers: `JOBS` is in-process state, so a second
 uvicorn worker would not see jobs started by the first.
 
-## Deploying the frontend to Vercel
+## Pointing the frontend at the API
 
-### `VITE_API_BASE` is required, not optional
+Vercel serves only the SPA — there is no API there. The browser has to be told
+where the backend lives, and forgetting this is the single most common reason a
+deployment fails while local works: the request goes to Vercel, gets a `404` with
+the SPA's HTML, and reports a failure.
 
-This is the single most common reason a Vercel deployment fails while local
-works. Vercel serves only the SPA — there is no API there. If `VITE_API_BASE`
-is unset, the browser posts to its own origin, Vercel answers `404` with the
-SPA's HTML, and every analysis reports a failure.
+Two ways to set it, in precedence order:
 
-Set it in the Vercel project settings (not in a committed `.env`):
+### 1. `frontend/public/config.js` (usual path)
 
+```js
+window.__SKIMREEL_CONFIG__ = { apiBase: "https://skimreel-api.fly.dev" }
 ```
-VITE_API_BASE=https://<your-app>.fly.dev
-```
 
-Vite inlines this at **build** time, so changing it requires a redeploy, not just
-a restart. Confirm it took effect by checking the deployed bundle contains your
-API host, or by watching the network tab: `/api/analyze` must go to the Fly
-domain, not to the Vercel one.
+Committed to the repo and read at page load, so changing the backend is one
+line and a push — no rebuild, no dashboard. It holds a public URL, not a secret.
 
-The `CORS_ALLOW_ORIGINS` value on Fly must include the Vercel domain exactly,
-scheme included.
+### 2. `VITE_API_BASE` (Vercel project env var)
 
-Verify the two hosts talk to each other:
+Set in Vercel → Settings → Environment Variables, for **Production and Preview**
+(Production only leaves preview deploys broken). This wins over `config.js` when
+present.
+
+Vite inlines it at **build** time, so saving it does nothing until you redeploy.
+Skip a redeploy and you get the same failure as having no API host at all.
+
+### The value's format
+
+Origin only: no trailing slash, no `/api` suffix. `https://skimreel-api.fly.dev`.
+
+### Verify
 
 ```bash
 curl -i -X POST https://<your-vercel-domain>/api/analyze -F length=30
-# Expect a JSON error from the Fly API (e.g. 422 or 400), NOT an HTML 404 page.
+# A JSON error (400/422) means the API answered. An HTML 404 means no API host.
 ```
+
+Or in the browser: DevTools → Network → Analyze. `/api/analyze` must show the
+Fly domain as its Request URL.
+
+### CORS runs the other way
+
+The browser is on Vercel and calls out to Fly, so **Fly** must accept the Vercel
+origin. That is `CORS_ALLOW_ORIGINS` in `fly.toml`, which is already set to
+`https://skimreel.vercel.app`. Miss it and the request is blocked with no server
+log to explain why.
 
 Local file uploads are capped by the host's request size limit; Vercel and Fly
 both sit well below a typical video file, so large uploads will fail in

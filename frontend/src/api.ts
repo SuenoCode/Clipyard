@@ -1,8 +1,17 @@
-// Empty string keeps requests same-origin, which is what the Vite dev server
-// proxy and a Vercel rewrite both expect. Set VITE_API_BASE to the deployed API
-// origin (e.g. https://api.skimreel.dev) when the SPA and API live on different
-// hosts.
-const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "")
+// Where the API lives, resolved in precedence order:
+//
+//   1. VITE_API_BASE      build-time env var, when one is available
+//   2. public/config.js   runtime file, read at page load from
+//                         window.__SKIMREEL_CONFIG__.apiBase
+//   3. ""                 same-origin, which the Vite dev proxy handles
+//
+// config.js is the normal path: the host can change in one committed line with
+// no rebuild and no dashboard step.
+const API_BASE = (
+  import.meta.env.VITE_API_BASE ||
+  window.__SKIMREEL_CONFIG__?.apiBase ||
+  ""
+).replace(/\/$/, "")
 
 export const API_ORIGIN = API_BASE || window.location.origin
 
@@ -10,7 +19,7 @@ export const API_ORIGIN = API_BASE || window.location.origin
  * Turn a non-OK response into something diagnosable.
  *
  * The API answers errors with JSON `{detail}`. When the request never reaches
- * the API at all - a missing VITE_API_BASE means this hits the SPA host, which
+ * the API at all - no API host configured means this hits the SPA host, which
  * answers 404 with HTML - the generic "Analysis failed" hides the real cause.
  */
 async function describeFailure(
@@ -40,8 +49,9 @@ async function describeFailure(
   if (type.includes("text/html")) {
     return (
       `${fallback} (HTTP ${res.status} from ${res.url} returned HTML, not the API). ` +
-      "The API is probably not reachable: check that VITE_API_BASE is set in the " +
-      "Vercel project and points at the deployed backend."
+      "No API host is configured, so this went to the site itself. Set " +
+      "apiBase in frontend/public/config.js, or VITE_API_BASE in Vercel, to the " +
+      "deployed backend origin."
     )
   }
   return `${fallback} (HTTP ${res.status})`
@@ -89,8 +99,9 @@ export async function analyzeVideo(data: FormData): Promise<{ job: string }> {
   } catch (cause) {
     // Network-level failure: wrong host, blocked by CORS, or the API is down.
     throw new Error(
-      `Could not reach the API at ${API_ORIGIN}. Check VITE_API_BASE and that ` +
-        `the backend is running and allows this origin. (${
+      `Could not reach the API at ${API_ORIGIN}. Set apiBase in ` +
+        `frontend/public/config.js (or VITE_API_BASE in Vercel), and allow this ` +
+        `site's origin on the backend. (${
           cause instanceof Error ? cause.message : String(cause)
         })`,
     )

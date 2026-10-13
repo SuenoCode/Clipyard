@@ -2,10 +2,15 @@
 #
 #   fly launch --no-deploy --copy-config   (first time)
 #   fly volumes create skimreel_data --size 10 --region ord
-#   fly secrets set YTDLP_COOKIES_FILE=/data/cookies.txt
 #   fly deploy
 #
-# Adjust app/region/primary_region to match your own Fly account.
+# Then set the frontend's API host: Vercel project env VITE_API_BASE, or
+# frontend/public/config.js. And give Fly the caller it must accept:
+#   fly secrets set CORS_ALLOW_ORIGINS=https://skimreel.vercel.app
+#
+# For YouTube, supply cookies (both are secrets - never commit them):
+#   fly secrets set YTDLP_COOKIES="$(cat cookies.txt)"     (inline, preferred)
+#   fly secrets set YTDLP_COOKIES_FILE=/data/cookies.txt  (file already on the volume)
 
 app = "skimreel-api"
 primary_region = "ord"
@@ -16,8 +21,10 @@ primary_region = "ord"
 [env]
   PORT = "8080"
   SKIMREEL_DOWNLOAD_DIR = "/data"
-  # Allow the Vercel-hosted SPA. Replace with your real domain, comma-separated.
-  CORS_ALLOW_ORIGINS = "http://localhost:5173,http://localhost:8443"
+  # Exact origins allowed to call the API from a browser. This is a public
+  # value, not a secret, so it lives in version control where it is reviewable.
+  # Keep the loopback entries for `npm run dev` against a deployed API.
+  CORS_ALLOW_ORIGINS = "https://skimreel.vercel.app,http://localhost:5173,http://localhost:8443"
 
 [[mounts]]
   source = "skimreel_data"

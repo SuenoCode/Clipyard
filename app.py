@@ -2,6 +2,7 @@ import os
 import re
 import json
 import uuid
+import hashlib
 import threading
 import time
 import subprocess
@@ -96,6 +97,27 @@ def _curl_cffi_available():
         return False
 
 
+def _write_inline_cookies(text: str) -> str:
+    """Materialise YTDLP_COOKIES into a file yt-dlp can read.
+
+    yt-dlp only accepts a cookie *path*. The filename embeds a hash of the
+    contents so a rotated secret never serves a stale file, and it is rewritten
+    whenever the hash changes. Permissions are owner-only because this is a live
+    session for a real account.
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), f"skimreel-cookies-{digest}.txt")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+    except OSError:
+        # A read-only /tmp would make transcription unavailable, but analysis and
+        # clip cutting should still work, so fall back to no cookies.
+        return ""
+    return path
+
+
 def base_ydl_opts() -> dict:
     opts = {
         'geo_bypass': True,
@@ -125,6 +147,14 @@ def base_ydl_opts() -> dict:
         opts['cookiesfrombrowser'] = tuple(
             part.strip() for part in cookies_from_browser.split(":")
         )
+
+    # Container platforms pass secrets as env vars, and shipping a cookie file
+    # in the image would bake a live account session into it. YTDLP_COOKIES wins
+    # only when no readable cookie file was found, so a file on the volume stays
+    # authoritative.
+    cookies_inline = os.environ.get("YTDLP_COOKIES", "").strip()
+    if cookies_inline and not opts.get("cookiefile"):
+        opts['cookiefile'] = _write_inline_cookies(cookies_inline)
 
     impersonate = os.environ.get("YTDLP_IMPERSONATE", "").strip()
     if impersonate and _curl_cffi_available():

@@ -29,13 +29,10 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-transcribe.tx
 
 COPY app.py ./
 
-# Video scratch space. Mount a volume here so clips survive restarts.
-RUN mkdir -p /srv/downloads
-ENV SKIMREEL_DOWNLOAD_DIR=/srv/downloads
-VOLUME ["/srv/downloads"]
-
-# Keep the Whisper model on the volume; otherwise every cold start re-downloads
-# ~140MB before the first transcription can run.
+# Where downloads and generated clips go, and where the Whisper model is cached
+# so a cold start does not re-download ~140MB. Both are set by the platform:
+# fly.toml points SKIMREEL_DOWNLOAD_DIR at the mounted volume and these paths
+# assume that same volume. Nothing is baked into the image.
 ENV HF_HOME=/data/huggingface
 
 EXPOSE 8080

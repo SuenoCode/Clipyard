@@ -7,3 +7,12 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv
 }
+
+interface SkimReelRuntimeConfig {
+  /** Origin of the API, e.g. https://skimreel-api.fly.dev. Empty for same-origin. */
+  apiBase?: string
+}
+
+interface Window {
+  __SKIMREEL_CONFIG__?: SkimReelRuntimeConfig
+}
