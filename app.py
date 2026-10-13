@@ -10,6 +10,7 @@ import tempfile
 import cv2
 import numpy as np
 import shutil
+import sys
 from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
@@ -77,8 +78,25 @@ def norm_quality(quality: str) -> str:
 
 
 def format_str_for(quality: str) -> str:
+    """Build a yt-dlp selector that will not silently hand back 360p.
+
+    The old string ended in a bare `/best`, and yt-dlp's "best" means the best
+    *pre-merged* file, which on YouTube is format 18 - 640x360, unchanged since
+    2010. Every clause here is height filtered, so a bare `/best` can never be
+    reached.
+
+    Within the ceiling the best available stream is chosen deliberately: if a
+    source only publishes 720p, asking for 1080p yields 720p rather than an error,
+    because that is the source's ceiling and not a fault in the request. The
+    resolution actually obtained is probed from the downloaded file and reported
+    in the job status, so a caller is never left guessing.
+    """
     height = norm_quality(quality)
-    return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+    return (
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}]/"
+        f"bestvideo[height<={height}]"
+    )
 
 
 # --- yt-dlp options ---------------------------------------------------------
@@ -86,7 +104,21 @@ def format_str_for(quality: str) -> str:
 # "Sign in to confirm you're not a bot". Cookies are the reliable fix, so both a
 # Netscape cookies.txt path and a browser name are supported via the environment.
 
-YTDLP_CLIENTS = ["tv", "web_safari", "mweb", "web", "android"]
+# player_client is deliberately NOT pinned.
+#
+# An earlier version hardcoded ["tv", "web_safari", "mweb", "web", "android"] and
+# that list was the cause of the 640x360 output: every client in it was either
+# dead or capped, so yt-dlp quietly fell through to format 18 (the 360p
+# pre-merged stream). Pinning is worse than useless here because the set of
+# clients that work changes with YouTube and with the yt-dlp version, and a stale
+# pin silently costs resolution instead of erroring.
+#
+# Measured on yt-dlp 2026.08.19 with Node 24 available for nsig extraction:
+#   default clients                 1920x1080 available  <- what we now use
+#   player_client=web               no formats (PO token gated)
+#   player_client=mweb              no formats (PO token gated)
+# So the defaults are both the simplest and the highest quality; the only reason
+# to pin would be a format check that showed defaults failing, which it does not.
 
 
 def _curl_cffi_available():
@@ -125,11 +157,10 @@ def base_ydl_opts() -> dict:
         'quiet': True,
         'no_warnings': True,
         'retries': 3,
-        'extractor_args': {
-            'youtube': {
-                'player_client': YTDLP_CLIENTS,
-            }
-        },
+        # No player_client / extractor_args here on purpose: pinning the client was
+        # what forced the 640x360 output. Letting yt-dlp pick its own defaults is
+        # both simpler and higher quality, and it means a yt-dlp upgrade can fix
+        # client selection without touching this file.
     }
 
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
@@ -249,6 +280,20 @@ def open_capture(path: str):
     return cap, cleanup
 
 
+def _cookies_configured() -> bool:
+    """True if yt-dlp will be given cookies in any of the three supported forms.
+
+    base_ydl_opts() accepts a cookie file, inline text, or a local browser, so
+    health must consider all three - checking only the file form reported
+    "cookies": false on installs that were working fine.
+    """
+    if os.environ.get("YTDLP_COOKIES_FILE", "").strip():
+        return True
+    if os.environ.get("YTDLP_COOKIES", "").strip():
+        return True
+    return bool(os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip())
+
+
 @app.get("/api/health")
 def health():
     """Liveness probe for the container host. Also reports whether yt-dlp is
@@ -257,7 +302,7 @@ def health():
     return {
         "ok": True,
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        "cookies": bool(os.environ.get("YTDLP_COOKIES_FILE", "").strip()),
+        "cookies": _cookies_configured(),
         "download_dir_writable": os.access(DOWNLOAD_DIR, os.W_OK),
     }
 
@@ -318,6 +363,8 @@ def get_job(job_id: str):
         "moments": j["moments"],
         "error": j["error"],
         "duration": j.get("duration", 0),
+        "source_height": j.get("source_height", 0),
+        "requested_quality": j.get("quality", ""),
         "transcripts": j.get("transcripts", {})
     }
 
@@ -328,6 +375,46 @@ def moment_of(job_id: str, idx: int):
     if idx < 0 or idx >= len(moments):
         raise HTTPException(status_code=404, detail="Moment index out of range")
     return moments[idx]
+
+
+def _fetch_source(job_id: str, original_url: str, video_path: str):
+    """Download the source video with yt-dlp's own downloader.
+
+    This has to be a real download to disk, not a stream URL handed to ffmpeg.
+    The googlevideo URLs yt-dlp resolves are signed and expect the headers yt-dlp
+    itself sends, so a bare `ffmpeg -i <url>` is answered with
+    "Server returned 403 Forbidden". Downloading first also means the analysis pass
+    and every later clip, preview and transcript read one local file instead of
+    re-resolving the source.
+    """
+    quality = JOBS[job_id].get("quality", "720")
+    ydl_opts = base_ydl_opts()
+    ydl_opts.update({
+        'format': format_str_for(quality),
+        'outtmpl': video_path,
+        'merge_output_format': 'mp4',
+    })
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(original_url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        for leftover in (video_path + ".part", video_path):
+            if os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Could not download the source video: {e}. "
+                "If this is a YouTube link, the usual cause is the bot check - "
+                "close the browser holding the cookie database, then set "
+                "YTDLP_COOKIES_FROM_BROWSER (e.g. chrome) or YTDLP_COOKIES and "
+                "restart the API. Check /api/health to see whether cookies are "
+                "being picked up."
+            ),
+        ) from e
 
 
 def ensure_source(job_id: str) -> str:
@@ -343,18 +430,31 @@ def ensure_source(job_id: str) -> str:
 
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_source.mp4")
     if not os.path.exists(video_path):
-        ydl_opts = base_ydl_opts()
-        ydl_opts.update({
-            'format': format_str_for(j.get("quality", "720")),
-            'outtmpl': video_path,
-            'merge_output_format': 'mp4',
-        })
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([original_url])
+        # Serialised, and re-checked inside the lock: two requests for the same
+        # job would otherwise run yt-dlp concurrently against one output path,
+        # collide on the .part file, and fail the loser's rename with WinError 32
+        # on Windows while the winner's download sits complete but unrenamed.
+        with artifact_lock(f"source:{job_id}"):
+            if not os.path.exists(video_path):
+                info = _fetch_source(job_id, original_url, video_path)
+                # Record the real title and duration while the metadata is in hand.
+                # Downloading the source here means process_job no longer has a
+                # separate extract to call, so without this the UI would show the
+                # on-disk filename, which is just the job id.
+                if isinstance(info, dict):
+                    if info.get("title") and j.get("title") in (None, "", "Untitled"):
+                        j["title"] = info["title"]
+                    if info.get("duration"):
+                        j["duration"] = float(info["duration"])
 
     if not os.path.exists(video_path):
         found = None
         for f in os.listdir(DOWNLOAD_DIR):
+            # Generated artifacts share the job-id prefix, so a preview or clip
+            # could otherwise be picked up here and handed to the cutter as if it
+            # were the source.
+            if "_preview" in f or "_clip_" in f:
+                continue
             if f.startswith(job_id) and f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts')):
                 found = os.path.join(DOWNLOAD_DIR, f)
                 break
@@ -364,12 +464,62 @@ def ensure_source(job_id: str) -> str:
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Failed to download source video")
 
+    # Report the resolution actually obtained. Format selection is a ceiling, so a
+    # 1080p request against a 360p source legitimately yields 360p; surfacing the
+    # real height keeps that from looking like a silent downgrade.
+    if not j.get("source_height"):
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.release()
+            if h:
+                j["source_height"] = h
+
     j["video_path"] = video_path
     return video_path
 
 
 def ffmpeg_run(cmd):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    """Run ffmpeg and fail loudly.
+
+    No call site inspects the result, so without a check here a missing binary
+    surfaces as a raw FileNotFoundError traceback and a failed encode surfaces as
+    a misleading "Failed to generate clip" with ffmpeg's stderr discarded.
+    """
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffmpeg was not found on PATH. It is required for preview, "
+            "Download MP4 and transcription - install it and restart the API."
+        )
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-4:]
+        raise RuntimeError("ffmpeg failed: " + " ".join(tail))
+    return proc
+
+
+def encode_to(args, out_path):
+    """Publish an ffmpeg output atomically, failing with an actionable 503.
+
+    ffmpeg writes incrementally, so an interrupted run leaves a non-empty partial
+    file. Both callers treat "exists and non-empty" as a cache hit, so that
+    truncation would be served permanently - encode to a temp name and rename only
+    after ffmpeg reports success.
+
+    The temp name keeps the real extension: ffmpeg picks its muxer from it, so
+    `foo.mp4.part` fails to initialise with "Error opening output file".
+    """
+    root, ext = os.path.splitext(out_path)
+    tmp = f"{root}.part{ext}"
+    try:
+        ffmpeg_run(["ffmpeg", *args, tmp])
+        os.replace(tmp, out_path)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 @app.get("/api/clip/{job_id}/{idx}")
@@ -381,35 +531,48 @@ def get_clip(job_id: str, idx: int):
     if not os.path.exists(out_clip):
         with artifact_lock(f"clip:{job_id}:{idx}"):
             if not os.path.exists(out_clip):
-                ffmpeg_run([
-                    "ffmpeg", "-y", "-ss", str(m["start"]), "-i", video_path,
+                encode_to([
+                    "-y", "-ss", str(m["start"]), "-i", video_path,
                     "-t", str(m["end"] - m["start"]), "-c", "copy",
-                    "-movflags", "+faststart", out_clip
-                ])
+                    "-movflags", "+faststart",
+                ], out_clip)
 
     if os.path.exists(out_clip) and os.path.getsize(out_clip) > 0:
         return FileResponse(out_clip, media_type="video/mp4", filename=f"clip_{idx + 1}.mp4")
     raise HTTPException(status_code=500, detail="Failed to generate clip")
 
 
+# Bumped whenever the preview encode settings change, so every machine with a warm
+# cache picks up the new encode instead of serving stale files forever.
+PREVIEW_CACHE_VERSION = 2
+
+
 @app.get("/api/preview/{job_id}/{idx}")
 def get_preview(job_id: str, idx: int):
-    """Web-optimised re-encode of a moment so the browser can scrub it instantly."""
+    """Web-optimised re-encode of a moment so the browser can scrub it instantly.
+
+    Re-encoded rather than stream-copied because the source can be 4K/HEVC, and a
+    browser should not have to decode that to play a 30-second moment. Size and
+    CRF are set for visual transparency; the encode is version-stamped so changing
+    them later invalidates the cache.
+    """
     m = moment_of(job_id, idx)
     video_path = ensure_source(job_id)
 
-    out_preview = os.path.join(DOWNLOAD_DIR, f"{job_id}_preview_{idx}.mp4")
+    out_preview = os.path.join(
+        DOWNLOAD_DIR, f"{job_id}_preview{PREVIEW_CACHE_VERSION}_{idx}.mp4"
+    )
     if not os.path.exists(out_preview) or os.path.getsize(out_preview) == 0:
         with artifact_lock(f"preview:{job_id}:{idx}"):
             if not os.path.exists(out_preview) or os.path.getsize(out_preview) == 0:
-                ffmpeg_run([
-                    "ffmpeg", "-y", "-ss", str(m["start"]), "-i", video_path,
+                encode_to([
+                    "-y", "-ss", str(m["start"]), "-i", video_path,
                     "-t", str(m["end"] - m["start"]),
-                    "-vf", "scale='min(854,iw)':-2",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                    "-vf", "scale='min(1280,iw)':-2",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                    "-c:a", "aac", "-b:a", "96k", out_preview
-                ])
+                    "-c:a", "aac", "-b:a", "128k",
+                ], out_preview)
 
     if os.path.exists(out_preview) and os.path.getsize(out_preview) > 0:
         return FileResponse(out_preview, media_type="video/mp4")
@@ -601,10 +764,13 @@ def post_transcribe(job_id: str, idx: int):
 
         with tempfile.TemporaryDirectory() as tmp:
             wav_path = os.path.join(tmp, "segment.wav")
-            ffmpeg_run([
-                "ffmpeg", "-y", "-ss", str(start), "-i", video_path, "-t", str(length),
-                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path
-            ])
+            try:
+                ffmpeg_run([
+                    "ffmpeg", "-y", "-ss", str(start), "-i", video_path, "-t", str(length),
+                    "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path
+                ])
+            except RuntimeError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
             if not os.path.exists(wav_path):
                 raise HTTPException(status_code=422, detail="This clip has no audio track to transcribe.")
 
@@ -669,37 +835,11 @@ def fmt_time(seconds):
         return f"{h}:{m:02d}:{sec:02d}"
     return f"{m}:{sec:02d}"
 
-def get_stream_urls(url: str, quality: str):
-    ydl_opts = base_ydl_opts()
-    ydl_opts.update({
-        'format': format_str_for(quality),
-        'skip_download': True,
-    })
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get('title', 'Video')
-        duration = info.get('duration', 0)
-        
-        video_url = None
-        audio_url = None
-        
-        if 'url' in info and info.get('vcodec') != 'none':
-            video_url = info['url']
-        elif 'formats' in info:
-            for f in info['formats']:
-                if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('url'):
-                    video_url = f['url']
-                    break
-            for f in info['formats']:
-                if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url'):
-                    audio_url = f['url']
-                    break
-        
-        if not video_url and 'url' in info:
-            video_url = info['url']
-            
-        return video_url, audio_url, title, duration
+# get_stream_urls() used to hand a signed googlevideo URL to OpenCV for frame
+# sampling. Those URLs expect the headers yt-dlp sends, so a bare request got 403
+# and every URL job failed at "Analyzing video". process_job now downloads the
+# source through yt-dlp instead, and ensure_source records the title and duration
+# from the same extract, so this has no callers left.
 
 def analyze_stream(video_url: str, duration: float, clip_length: float, count: int, job_id: str):
     j = JOBS[job_id]
@@ -804,30 +944,33 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
                 j["title"] = os.path.basename(video_path)
             j["duration"] = duration
         else:
-            j["status"] = "Getting stream URLs..."
+            j["status"] = "Downloading source..."
             j["pct"] = 5
-            
-            video_url, audio_url, title, duration = get_stream_urls(url, quality)
-            
-            if not video_url:
-                raise Exception("Could not extract video stream URL")
-            
-            j["video_url"] = video_url
-            j["audio_url"] = audio_url
-            j["title"] = title
-            j["duration"] = duration
-        
+
+            # Download through yt-dlp rather than streaming the signed googlevideo
+            # URL into OpenCV. Those URLs are bound to the requesting IP and expect
+            # the headers yt-dlp sends; a bare ffmpeg/OpenCV request gets 403, which
+            # surfaced as "Error opening input: Server returned 403 Forbidden" and
+            # made every URL job fail. yt-dlp already does this download for
+            # ensure_source, so doing it here means one download serves both the
+            # analysis and every later clip/preview/transcribe.
+            video_path = ensure_source(job_id)
+
+            if not j.get("title") or j["title"] == "Untitled":
+                j["title"] = os.path.basename(video_path)
+            duration = j.get("duration") or 0
+            if duration <= 0:
+                duration = probe_duration(video_path)
+                j["duration"] = duration
+
         if duration <= 0:
             duration = 10.0
-            
+
         j["status"] = "Analyzing video..."
         j["pct"] = 10
-        
-        if is_local_file:
-            video_url = j["video_path"]
-        else:
-            video_url = j["video_url"]
-        
+
+        video_url = j["video_path"]
+
         moments = analyze_stream(video_url, duration, clip_length, count, job_id)
         
         j["moments"] = moments
