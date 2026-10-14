@@ -17,7 +17,8 @@ main{max-width:1110px;margin:auto}.hero{position:relative;text-align:center;padd
 .status-dot-pulse{animation:dot-pulse 1.2s ease-in-out infinite}@keyframes dot-pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 #1ec1cb55}50%{opacity:.45;box-shadow:0 0 0 5px #1ec1cb00}}
 .progress-panel{background:#212624;border:1px solid #3b443d;border-radius:12px;padding:28px;margin:30px 0 40px;max-width:720px;margin-left:auto;margin-right:auto}
 .progress-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:14px}.progress-stage{font-size:15px;font-weight:600;letter-spacing:-.2px}.progress-pct{font:15px 'IBM Plex Mono',monospace;color:var(--cyan)}
-.progress-track{height:8px;background:#1a1f1e;border-radius:4px;overflow:hidden}.progress-fill{height:100%;background:var(--cyan);border-radius:4px;transition:width .35s ease}
+.progress-bar{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;height:10px}.progress-seg{background:#1a1f1e;border-radius:3px;overflow:hidden}.progress-seg.current{background:#232b29}.progress-seg-fill{height:100%;width:0;border-radius:3px;transition:width .35s ease}.progress-seg-fill.done{transition:none}
+.progress-detail{margin:11px 0 0;font:11px 'IBM Plex Mono',monospace;color:#8e968f;letter-spacing:.4px;min-height:14px}
 .progress-steps{list-style:none;display:flex;flex-wrap:wrap;gap:10px 28px;margin:22px 0 0;padding:0;font:10px 'IBM Plex Mono',monospace;letter-spacing:1.2px;color:#626b66}
 .progress-steps li{display:flex;align-items:center;gap:8px;transition:color .3s}.progress-steps li.done{color:var(--cyan)}.progress-steps li.current{color:#c9d1c8}
 .step-dot{width:17px;height:17px;border-radius:50%;border:1px solid #454e49;display:flex;align-items:center;justify-content:center;flex-shrink:0}.progress-steps li.done .step-dot{border-color:var(--cyan)}.progress-steps li.current .step-dot{border-color:var(--cyan);animation:dot-pulse 1.2s ease-in-out infinite}

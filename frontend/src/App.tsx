@@ -6,6 +6,13 @@ import { analyzeVideo, pollJob, releaseJob, JobStatus } from "./api"
 
 const assetPathPrefix = "/assets"
 
+// Mirrors PCT_START / PCT_TRANSFER_END in app.py: the transfer is the first of
+// three stages and owns 0-60 of the bar, whether the bytes come from the server
+// (a download) or from the browser (an upload), so the stage's own percentage
+// is exact in both cases. The analysis pass owns the rest.
+const PCT_START = 0
+const PCT_TRANSFER_END = 60
+
 type View = "input" | "loading" | "results" | "error"
 
 export default function App() {
@@ -19,9 +26,24 @@ export default function App() {
   const [view, setView] = useState<View>("input")
   const [jobId, setJobId] = useState<string | null>(null)
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null)
+  const [uploadPct, setUploadPct] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const input = useRef<HTMLInputElement>(null)
   const pollInterval = useRef<number | null>(null)
+  // Pending handover to the results view, held so the last bar segment fills.
+  const doneTimer = useRef<number | null>(null)
+  // Highest percentage shown so far for the running job. The bar is a single
+  // timeline - upload in the browser, download and analysis from the API - and
+  // each source starts reporting a moment later than the last, so without a
+  // floor the bar drops to 2% at each handover and reads as a restart.
+  const pctFloor = useRef(0)
+
+  function clearDoneTimer() {
+    if (doneTimer.current) {
+      window.clearTimeout(doneTimer.current)
+      doneTimer.current = null
+    }
+  }
 
   function addFiles(incoming: File[]) {
     const videos = incoming.filter(
@@ -63,6 +85,9 @@ export default function App() {
     setView("loading")
     setError(null)
     setMessage("")
+    setUploadPct(null)
+    pctFloor.current = 0
+    clearDoneTimer()
 
     // The user is starting over, so the previous analysis' downloaded source,
     // previews and clips are dead weight on the API host. Release them before
@@ -83,12 +108,27 @@ export default function App() {
     formData.append("count", String(count))
     formData.append("quality", quality)
 
-    analyzeVideo(formData)
+    // Only an upload has a transfer the server cannot report on, so only an
+    // upload needs the browser to narrate it.
+    analyzeVideo(
+      formData,
+      files.length
+        ? (sent) => {
+            const mapped = Math.round(
+              PCT_START + ((PCT_TRANSFER_END - PCT_START) * sent) / 100,
+            )
+            if (mapped > pctFloor.current) pctFloor.current = mapped
+            setUploadPct(sent)
+          }
+        : undefined,
+    )
       .then(({ job }) => {
+        setUploadPct(null)
         setJobId(job)
         startPolling(job)
       })
       .catch((err) => {
+        setUploadPct(null)
         setView("error")
         setError(err.message)
       })
@@ -100,14 +140,23 @@ export default function App() {
     const check = async () => {
       try {
         const status = await pollJob(job)
+        if (status.pct > pctFloor.current) pctFloor.current = status.pct
         setJobStatus(status)
         if (status.done) {
           if (pollInterval.current) clearInterval(pollInterval.current)
+          clearDoneTimer()
           if (status.error) {
             setView("error")
             setError(status.error)
           } else {
-            setView("results")
+            // The bar ends on a "ready" segment, and switching to the results
+            // the instant the job lands means that segment is never watched
+            // filling. Held just long enough for it to be seen. A failed job
+            // has no bar to finish, so its message shows at once.
+            doneTimer.current = window.setTimeout(() => {
+              doneTimer.current = null
+              setView("results")
+            }, 800)
           }
         }
       } catch {
@@ -126,17 +175,32 @@ export default function App() {
     setJobId(null)
     setJobStatus(null)
     setError(null)
+    clearDoneTimer()
     if (pollInterval.current) clearInterval(pollInterval.current)
   }
 
   useEffect(() => {
     return () => {
       if (pollInterval.current) clearInterval(pollInterval.current)
+      clearDoneTimer()
     }
   }, [])
 
-  const loadingStage = jobStatus?.status || "Starting analysis..."
-  const loadingPct = jobStatus?.pct || 0
+  const uploading = uploadPct !== null
+  const loadingStage = uploading
+    ? "Uploading footage..."
+    : jobStatus?.status || "Starting analysis..."
+  const loadingPct = Math.max(
+    uploading
+      ? Math.round(
+          PCT_START + ((PCT_TRANSFER_END - PCT_START) * uploadPct) / 100,
+        )
+      : jobStatus?.pct || 0,
+    pctFloor.current,
+  )
+  const loadingDetail = uploading
+    ? `${uploadPct}% sent`
+    : jobStatus?.detail || ""
   const sourceLabel = files[0]?.name || (link.trim() ? "ONLINE SOURCE" : "")
 
   if (view === "loading") {
@@ -144,7 +208,9 @@ export default function App() {
       <LoadingView
         stage={loadingStage}
         pct={loadingPct}
+        detail={loadingDetail}
         sourceLabel={sourceLabel}
+        remote={!files.length}
         onCancel={handleBack}
       />
     )

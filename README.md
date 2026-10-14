@@ -98,6 +98,14 @@ curl https://<your-app>.fly.dev/api/health
 
 `/api/health` reports whether ffmpeg is present, cookies are configured, and the
 download directory is writable — the three things that break silently otherwise.
+`cookies` is true only when yt-dlp will really be given a cookie file that it
+accepts: an env var pointing at a missing, empty, or non-Netscape file reports
+`false`, and `cookie_source` names which of the three forms was found or why
+none was.
+
+```bash
+fly secrets set YTDLP_COOKIES="$(cat cookies.txt)"   # then: fly secrets list
+```
 
 Scale by adding machines, not workers: `JOBS` is in-process state, so a second
 uvicorn worker would not see jobs started by the first.

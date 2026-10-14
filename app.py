@@ -183,6 +183,14 @@ def format_str_for(quality: str) -> str:
     2010. Every clause here is height filtered, so a bare `/best` can never be
     reached.
 
+    The first clause asks for H.264 video with AAC audio, which is what merges
+    into an MP4 without re-encoding a byte: the download is then already the MP4
+    everything downstream assumes, and costs nothing to get. The clauses after it
+    are the previous selector unchanged, so a source that publishes no H.264 at
+    all (a 4K-only feed, a site with one codec) still resolves to the same
+    streams it always did - preferring MP4-native streams never trades away
+    resolution. Whatever those clauses return, ensure_mp4() converts afterwards.
+
     Within the ceiling the best available stream is chosen deliberately: if a
     source only publishes 720p, asking for 1080p yields 720p rather than an error,
     because that is the source's ceiling and not a fault in the request. The
@@ -191,6 +199,8 @@ def format_str_for(quality: str) -> str:
     """
     height = norm_quality(quality)
     return (
+        f"bestvideo[height<={height}][vcodec~='^(avc|h264)']"
+        f"+bestaudio[acodec~='^(mp4a|aac)']/"
         f"bestvideo[height<={height}]+bestaudio/"
         f"best[height<={height}]/"
         f"bestvideo[height<={height}]"
@@ -198,6 +208,10 @@ def format_str_for(quality: str) -> str:
 
 
 # --- yt-dlp options ---------------------------------------------------------
+# yt-dlp rejects a cookie file that does not start with this line, so health
+# checks for the same magic rather than its own idea of a valid cookie file.
+NETSCAPE_MAGIC = "# Netscape HTTP Cookie File"
+
 # YouTube answers anonymous requests from datacenter IPs with
 # "Sign in to confirm you're not a bot". Cookies are the reliable fix, so both a
 # Netscape cookies.txt path and a browser name are supported via the environment.
@@ -248,12 +262,47 @@ def _write_inline_cookies(text: str) -> str:
     return path
 
 
+def _usable_cookie_text(text: str) -> bool:
+    """True if this is a cookie payload yt-dlp will accept.
+
+    yt-dlp requires the Netscape magic on the first line and refuses anything
+    else with "Cookies file must be Netscape formatted", which is the single most
+    common way to point a config at the wrong file. Both the download options
+    and /api/health ask this, so health cannot report a green light for a file
+    that every download would then reject.
+    """
+    return text.startswith(NETSCAPE_MAGIC)
+
+
+def _usable_cookie_file(path: str) -> tuple[bool, str]:
+    """(accepted, why not) for a cookie file path."""
+    if not os.path.exists(path):
+        return False, "missing"
+    if not os.access(path, os.R_OK):
+        return False, "unreadable"
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError as e:
+        return False, str(e)
+    if not head.strip():
+        return False, "empty"
+    if not _usable_cookie_text(head):
+        return False, "not Netscape format"
+    return True, ""
+
+
 def base_ydl_opts() -> dict:
     opts = {
         'geo_bypass': True,
         'nocheckcertificate': True,
         'quiet': True,
         'no_warnings': True,
+        # Download progress reaches the UI through a progress_hook, not through
+        # the console. Left on, yt-dlp prints a line per fragment, which floods
+        # the uvicorn log with the 600-line tail of a single download and buries
+        # the request log next to it.
+        'noprogress': True,
         'retries': 3,
         # No player_client / extractor_args here on purpose: pinning the client was
         # what forced the 640x360 output. Letting yt-dlp pick its own defaults is
@@ -268,10 +317,20 @@ def base_ydl_opts() -> dict:
         if not os.path.isabs(cookies_file):
             cookies_file = os.path.join(BASE_DIR, cookies_file)
         cookies_file = os.path.abspath(cookies_file)
-        if os.path.exists(cookies_file):
+        # Same acceptance test as health, so a file that is not usable is not
+        # handed to yt-dlp: it would fail every download with a message about
+        # formatting rather than about the bot check the user is actually
+        # hitting. A rejected file falls through to the next form.
+        ok, _why = _usable_cookie_file(cookies_file)
+        if ok:
             opts['cookiefile'] = cookies_file
 
     cookies_from_browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    # "false" is how yt-dlp spells "no browser"; passed through as a name it
+    # becomes a request for a browser literally called false, and every
+    # download fails on it.
+    if cookies_from_browser.lower() in ("false", "none", "0"):
+        cookies_from_browser = ""
     if cookies_from_browser and not opts.get("cookiefile"):
         opts['cookiesfrombrowser'] = tuple(
             part.strip() for part in cookies_from_browser.split(":")
@@ -282,7 +341,7 @@ def base_ydl_opts() -> dict:
     # only when no readable cookie file was found, so a file on the volume stays
     # authoritative.
     cookies_inline = os.environ.get("YTDLP_COOKIES", "").strip()
-    if cookies_inline and not opts.get("cookiefile"):
+    if cookies_inline and _usable_cookie_text(cookies_inline) and not opts.get("cookiefile"):
         opts['cookiefile'] = _write_inline_cookies(cookies_inline)
 
     impersonate = os.environ.get("YTDLP_IMPERSONATE", "").strip()
@@ -294,6 +353,225 @@ def base_ydl_opts() -> dict:
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv")
+
+# One bar covers the three stages a job goes through, and each one ends at a
+# published percentage so the UI can cut the bar into three bars and show the
+# running stage's own progress - not the job's overall total, which is the
+# number that made a two-thirds-full bar read as "87%". The transfer owns the
+# most because yt-dlp reports exact byte counts for it and because it is by far
+# the longest wait: it used to sit at a flat 5% for the ten minutes a 600 MB
+# source took, which read as a hang rather than a download.
+PCT_START = 0
+PCT_TRANSFER_END = 60
+PCT_MOTION_END = 90
+PCT_PICK_END = 99
+
+
+def human_bytes(n) -> str:
+    """Byte count for a human, at the precision the number deserves."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+class DownloadProgress:
+    """Publishes yt-dlp's byte counters as job progress the UI can render.
+
+    Two things make the raw hook unusable on its own. It fires once per output
+    file, and a `bestvideo+bestaudio` job writes two, so reading it directly
+    restarts the figure from zero when the audio stream begins; the bytes of the
+    files already written are summed into the one in flight to keep a single
+    figure for the whole job. And the percentage yt-dlp reports is not
+    monotonic - a progressive stream revises its length estimate as it goes, so
+    its own log shows 43.5% then 42.6% - so the high water mark is kept and the
+    bar never runs backwards.
+    """
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.written = 0
+        self.written_total = 0
+        self.peak_pct = 0.0
+        self.last_line = ""
+
+    def __call__(self, d: dict):
+        j = JOBS.get(self.job_id)
+        if j is None:
+            # Released while the download was still running.
+            return
+
+        info = d.get("info_dict") or {}
+        downloaded = int(d.get("downloaded_bytes") or 0)
+        total = int(
+            d.get("total_bytes")
+            or d.get("total_bytes_estimate")
+            # Both are absent while a stream is being sized from scratch; the
+            # format dict still carries what the extractor advertised, which is
+            # what makes a percentage possible at all here.
+            or info.get("filesize")
+            or info.get("filesize_approx")
+            or 0
+        )
+
+        status = d.get("status")
+        if status == "finished":
+            self.written += downloaded
+            self.written_total += total or downloaded
+        elif status == "error":
+            return
+
+        have = self.written + downloaded
+        of = self.written_total + total
+        pct = (have / of * 100.0) if of > 0 else 0.0
+        pct = max(self.peak_pct, min(pct, 100.0))
+        self.peak_pct = pct
+
+        j["pct"] = PCT_START + int((PCT_TRANSFER_END - PCT_START) * pct / 100.0)
+        j["status"] = "Downloading source..."
+
+        parts = []
+        if status == "finished":
+            # One stream is written. Its bytes are already folded into `written`
+            # for the total, so counting them again here would read as more than
+            # the whole file.
+            parts.append(f"Downloaded {human_bytes(downloaded)}")
+        elif total:
+            parts.append(f"{human_bytes(have)} of {human_bytes(of)}")
+        elif downloaded > 0:
+            # No length was ever advertised, so bytes are all there is to say.
+            parts.append(f"{human_bytes(have)} so far")
+        if d.get("speed"):
+            parts.append(f"{human_bytes(d['speed'])}/s")
+        eta = d.get("eta")
+        if eta and status != "finished":
+            parts.append(f"{eta // 60} min left" if eta >= 60 else f"{eta}s left")
+
+        # The hook fires per fragment, so only publish when the human-readable
+        # line actually changes instead of writing to the job dict on every tick.
+        line = " · ".join(parts)
+        if line and line != self.last_line:
+            self.last_line = line
+            j["detail"] = line
+
+
+# ffprobe reports the QuickTime family under any of these names, and all of them
+# are containers ffmpeg writes as .mp4 - so an MP4 check has to accept them all
+# or it will transcode a file that was already fine.
+MP4_CONTAINERS = ("mov", "mp4", "m4a", "3gp", "3g2", "mj2")
+
+
+def probe_codecs(path: str):
+    """(container, video codec, audio codec) for a file, or None if unreadable.
+
+    Audio is None for a genuinely silent source, which is valid and must not be
+    confused with "no audio stream found" - the caller treats a silent video as
+    already-correct rather than re-encoding it.
+    """
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=format_name:stream=codec_type,codec_name",
+             "-of", "json", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+        )
+        info = json.loads(res.stdout.decode("utf-8", "ignore") or "{}")
+    except Exception:
+        return None
+
+    container = ((info.get("format") or {}).get("format_name") or "").split(",")[0].lower()
+    video = audio = None
+    for stream in info.get("streams") or []:
+        kind = stream.get("codec_type")
+        if kind == "video" and video is None:
+            video = (stream.get("codec_name") or "").lower()
+        elif kind == "audio" and audio is None:
+            audio = (stream.get("codec_name") or "").lower()
+    return container, video, audio
+
+
+def ensure_mp4(path: str) -> str:
+    """Guarantee an H.264/AAC MP4 exists for this source, and return its path.
+
+    Everything downstream assumes MP4: the clips are named .mp4, cut with
+    `-c copy`, and handed to a browser, which will not decode VP9 or Opus in an
+    MP4 container even though ffmpeg will happily write it there. yt-dlp can and
+    does deliver exactly that - a bestvideo+bestaudio pair is usually VP9 with
+    Opus - so the file is normalised here rather than trusted.
+
+    Conversion is a lossless remux whenever the codecs are already compatible
+    (H.264 video kept as-is, AAC kept, container repacked), and only re-encodes
+    when the codecs genuinely are not: an unplayable clip is a much worse failure
+    than a few minutes of CPU, and the alternative - a silent 200 with a video
+    nobody can play - is the failure mode this whole file is written around.
+
+    Best effort by design. If ffmpeg fails, the original file is left in place
+    and the job carries on: the source may still be readable, and failing a whole
+    analysis over a container fix would be the worse trade.
+    """
+    probed = probe_codecs(path)
+    if probed is None:
+        return path
+    container, video, audio = probed
+
+    if (
+        os.path.splitext(path)[1].lower() == ".mp4"
+        and container in MP4_CONTAINERS
+        and video == "h264"
+        and audio in (None, "", "aac")
+    ):
+        return path
+
+    target = os.path.splitext(path)[0] + ".mp4"
+    args = ["-y", "-i", path]
+    if video == "h264":
+        # The codec is already right; only the container needs rebuilding, and a
+        # copy costs a second rather than a re-encode.
+        args += ["-c:v", "copy"]
+    else:
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", "yuv420p"]
+    if audio in (None, ""):
+        args += ["-an"]
+    elif audio == "aac":
+        args += ["-c:a", "copy"]
+    else:
+        # Opus and Vorbis in an MP4 play in VLC and in nothing a browser ships.
+        args += ["-c:a", "aac", "-b:a", "192k"]
+    args += ["-movflags", "+faststart", "-f", "mp4"]
+
+    # Written to a temp name and renamed, for the same reason encode_to() does
+    # it: an interrupted run must not leave a truncated file that every later
+    # request would treat as a finished download.
+    tmp = target + ".part.mp4"
+    try:
+        ffmpeg_run(["ffmpeg", *args, tmp])
+        os.replace(tmp, target)
+    except RuntimeError as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        print(
+            f"[skimreel] could not convert {os.path.basename(path)} to mp4: {e}",
+            file=sys.stderr,
+        )
+        return path
+
+    if os.path.abspath(path) != os.path.abspath(target):
+        # A .mkv or .webm that has just been converted is dead weight; leaving it
+        # would double the space a single source takes.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return target
 
 
 def safe_upload_name(filename: str) -> str:
@@ -427,18 +705,52 @@ def open_capture(path: str):
     return cap, cleanup
 
 
-def _cookies_configured() -> bool:
-    """True if yt-dlp will be given cookies in any of the three supported forms.
+def cookie_status() -> dict:
+    """What yt-dlp will actually be given for cookies, and why not if it won't.
 
-    base_ydl_opts() accepts a cookie file, inline text, or a local browser, so
-    health must consider all three - checking only the file form reported
-    "cookies": false on installs that were working fine.
+    base_ydl_opts() accepts a Netscape cookie file, inline cookie text, or a
+    local browser, in that order of precedence, so health has to consider all
+    three - checking only the file form reported "cookies": false on installs
+    that were working fine.
+
+    It checks what will be used, not what is set, because an env var pointing
+    at a path that is not there hands yt-dlp nothing at all while still looking
+    configured. The format is checked too, using yt-dlp's own rule: it refuses a
+    file that does not start with the Netscape magic line, so health should not
+    call a saved HTML cookie export "configured".
     """
-    if os.environ.get("YTDLP_COOKIES_FILE", "").strip():
-        return True
-    if os.environ.get("YTDLP_COOKIES", "").strip():
-        return True
-    return bool(os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip())
+    path = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if path:
+        # base_ydl_opts resolves a bare filename against the repo, so health has
+        # to as well or the two disagree about the same setting.
+        if not os.path.isabs(path):
+            path = os.path.join(BASE_DIR, path)
+        path = os.path.abspath(path)
+        ok, why = _usable_cookie_file(path)
+        if ok:
+            return {"configured": True, "source": f"YTDLP_COOKIES_FILE={path}"}
+        return {"configured": False, "source": f"YTDLP_COOKIES_FILE={path} ({why})"}
+
+    inline = os.environ.get("YTDLP_COOKIES", "").strip()
+    if inline:
+        if _usable_cookie_text(inline):
+            return {"configured": True, "source": "YTDLP_COOKIES"}
+        return {"configured": False, "source": "YTDLP_COOKIES (not Netscape format)"}
+
+    browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if browser:
+        # "false" is yt-dlp's documented way of saying no browser at all, and it
+        # would otherwise be passed through as a browser literally named false.
+        if browser.lower() in ("false", "none", "0"):
+            return {"configured": False, "source": "YTDLP_COOKIES_FROM_BROWSER=false"}
+        return {"configured": True, "source": f"browser {browser}"}
+
+    return {
+        "configured": False,
+        "source": (
+            "no YTDLP_COOKIES_FILE, YTDLP_COOKIES or YTDLP_COOKIES_FROM_BROWSER set"
+        ),
+    }
 
 
 @app.get("/api/health")
@@ -446,10 +758,14 @@ def health():
     """Liveness probe for the container host. Also reports whether yt-dlp is
     likely to pass YouTube's bot check, which is the usual reason for a
     "deployed but every link fails" report."""
+    cookies = cookie_status()
     return {
         "ok": True,
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        "cookies": _cookies_configured(),
+        "cookies": cookies["configured"],
+        # Which of the three cookie forms was found, or why none was: without it
+        # a false here is indistinguishable from a typo in a secret name.
+        "cookie_source": cookies["source"],
         "download_dir_writable": os.access(DOWNLOAD_DIR, os.W_OK),
         "download_dir_synced": SYNC_PROVIDER,
     }
@@ -474,16 +790,43 @@ async def analyze(
         # characters the filesystem rejects, and it must never escape DOWNLOAD_DIR.
         safe_name = safe_upload_name(file.filename)
         video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_{safe_name}")
-        with open(video_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+        try:
+            with open(video_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+        except Exception as e:
+            # The copy is what actually receives the body, and it fails the same
+            # way any write does when the client hangs up mid-upload. No job
+            # exists yet, so nothing would ever clean the partial file up - it
+            # would just take up room until the volume filled.
+            received = 0
+            try:
+                received = os.path.getsize(video_path)
+            except OSError:
+                pass
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Upload failed after {human_bytes(received)}: {e}. "
+                    "The partial file was removed, so it is safe to try again."
+                ),
+            ) from e
         original_url = f"file://{video_path}"
         # Show the name the user recognises, not the prefixed one on disk.
         display_title = os.path.basename(str(file.filename).replace("\\", "/")) or safe_name
     
     JOBS[job_id] = {
         "done": False,
+        # An upload already has all its bytes by the time the job exists - the
+        # browser posted the whole file to reach this point - so it starts where
+        # a URL job's download ends. A URL job starts at the bottom instead, for
+        # DownloadProgress to climb from.
         "status": "Queued",
-        "pct": 0,
+        "pct": PCT_TRANSFER_END if video_path else PCT_START,
+        "detail": "",
         "title": display_title,
         "moments": [],
         "error": None,
@@ -513,8 +856,36 @@ def get_job(job_id: str):
         "duration": j.get("duration", 0),
         "source_height": j.get("source_height", 0),
         "requested_quality": j.get("quality", ""),
-        "transcripts": j.get("transcripts", {})
+        "transcripts": j.get("transcripts", {}),
+        "detail": j.get("detail", ""),
     }
+
+def purge_job_files(job_id: str) -> int:
+    """Delete every on-disk artifact named with this job id. Returns the count.
+
+    Artifacts are matched on the job-id prefix every one of them is named with,
+    which also catches yt-dlp's per-format fragments and .part files that an
+    interrupted download leaves behind - those are never served but they are just
+    as large. Job ids are uuids, so no other file's name can be one id's prefix
+    and this cannot delete an unrelated file.
+    """
+    removed = 0
+    try:
+        names = os.listdir(DOWNLOAD_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(job_id):
+            continue
+        try:
+            os.remove(os.path.join(DOWNLOAD_DIR, name))
+            removed += 1
+        except OSError:
+            # A file still locked by a cloud-sync client is left for the next
+            # sweep rather than failing the release.
+            pass
+    return removed
+
 
 @app.delete("/api/job/{job_id}")
 def delete_job(job_id: str):
@@ -524,11 +895,6 @@ def delete_job(job_id: str):
     at which the previous results are no longer being used. A 1080p source alone
     runs to hundreds of megabytes and every preview and clip adds to it, so a
     handful of analyses fills the volume the container mounts.
-
-    Artifacts are matched on the job-id prefix every one of them is named with,
-    which also catches yt-dlp's per-format fragments and .part files that an
-    interrupted download leaves behind - those are never served but they are
-    just as large.
 
     Only a finished job can be released: a job still running holds a download or
     an encode open, and deleting its source under a live ffmpeg fails the request
@@ -543,24 +909,7 @@ def delete_job(job_id: str):
     if not j.get("done"):
         raise HTTPException(status_code=409, detail="Job is still running")
 
-    removed = 0
-    try:
-        names = os.listdir(DOWNLOAD_DIR)
-    except OSError:
-        names = []
-    for name in names:
-        # Job ids are uuids, so no other artifact's name can be a longer id's
-        # prefix - this cannot delete an unrelated file.
-        if not name.startswith(job_id):
-            continue
-        try:
-            os.remove(os.path.join(DOWNLOAD_DIR, name))
-            removed += 1
-        except OSError:
-            # A file still locked by a cloud-sync client is left for the next
-            # sweep rather than failing the release.
-            pass
-
+    removed = purge_job_files(job_id)
     JOBS.pop(job_id, None)
     return {"released": True, "removed": removed}
 
@@ -589,7 +938,14 @@ def _fetch_source(job_id: str, original_url: str, video_path: str):
     ydl_opts.update({
         'format': format_str_for(quality),
         'outtmpl': video_path,
+        # Merge straight to MP4 where the chosen codecs allow it, which is the
+        # normal case now that the selector prefers H.264 + AAC. When they do
+        # not, ffmpeg still writes an MP4 container with the wrong codecs, and
+        # ensure_mp4() rewrites it properly afterwards.
         'merge_output_format': 'mp4',
+        # The hook is what the user sees; with it, yt-dlp's own progress output
+        # is silenced in base_ydl_opts so it is not printed twice.
+        'progress_hooks': [DownloadProgress(job_id)],
     })
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -608,8 +964,8 @@ def _fetch_source(job_id: str, original_url: str, video_path: str):
                 "If this is a YouTube link, the usual cause is the bot check - "
                 "close the browser holding the cookie database, then set "
                 "YTDLP_COOKIES_FROM_BROWSER (e.g. chrome) or YTDLP_COOKIES and "
-                "restart the API. Check /api/health to see whether cookies are "
-                "being picked up."
+                "restart the API. Cookies as configured: "
+                f"{cookie_status()['source']}."
             ),
         ) from e
 
@@ -688,6 +1044,16 @@ def ensure_source(job_id: str) -> str:
                 "to a local path outside OneDrive and retry."
             ),
         )
+
+    # Normalise the container and codecs once, the first time the source is
+    # needed. A download can legitimately arrive as WebM, or as MP4 holding VP9
+    # and Opus, and every clip, preview and transcript below assumes H.264/AAC
+    # MP4: cut with `-c copy` from anything else, the result is a file browsers
+    # refuse to play. Done after the playable check so a truncated download is
+    # rejected before any CPU is spent on it.
+    if not j.get("mp4_ready"):
+        video_path = ensure_mp4(video_path)
+        j["mp4_ready"] = True
 
     # Report the resolution actually obtained. Format selection is a ceiling, so a
     # 1080p request against a 360p source legitimately yields 360p; surfacing the
@@ -1098,13 +1464,19 @@ def analyze_stream(video_url: str, duration: float, clip_length: float, count: i
             diff = np.mean(np.abs(f1.astype(float) - f2.astype(float)) / 255.0)
             motion_scores.append(float(diff))
 
-            pct = 10 + int(70 * (i + 1) / N)
+            pct = PCT_TRANSFER_END + int((PCT_MOTION_END - PCT_TRANSFER_END) * (i + 1) / N)
             j["pct"] = pct
             j["status"] = f"Analyzing... {i+1}/{N}"
     finally:
         cap.release()
         cleanup()
-    
+
+    # Sampling is done; what is left is the ranking. It takes milliseconds, but
+    # it is a distinct phase, so the bar's third segment has an honest end to
+    # fill to rather than a label that never appears.
+    j["status"] = "Picking moments..."
+    j["pct"] = PCT_MOTION_END
+
     if motion_scores:
         max_m = max(motion_scores) or 1.0
         norm_m = [m / max_m for m in motion_scores]
@@ -1143,6 +1515,7 @@ def analyze_stream(video_url: str, duration: float, clip_length: float, count: i
         })
     
     moments.sort(key=lambda m: m["score"], reverse=True)
+    j["pct"] = PCT_PICK_END
     return moments
 
 def process_job(job_id: str, url: str, clip_length: float, count: int, quality: str = "720"):
@@ -1152,7 +1525,7 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
         
         if is_local_file:
             j["status"] = "Analyzing local file..."
-            j["pct"] = 10
+            j["pct"] = PCT_TRANSFER_END
             video_path = url.replace("file://", "")
             if not os.path.exists(video_path):
                 raise Exception("Local video file not found")
@@ -1170,7 +1543,7 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
             j["duration"] = duration
         else:
             j["status"] = "Downloading source..."
-            j["pct"] = 5
+            j["pct"] = PCT_START
 
             # Download through yt-dlp rather than streaming the signed googlevideo
             # URL into OpenCV. Those URLs are bound to the requesting IP and expect
@@ -1192,7 +1565,9 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
             duration = 10.0
 
         j["status"] = "Analyzing video..."
-        j["pct"] = 10
+        # The download phase owned everything up to here; take the bar to where it
+        # ended so the first sampled frame does not drop it back.
+        j["pct"] = PCT_TRANSFER_END
 
         video_url = j["video_path"]
 
@@ -1207,6 +1582,12 @@ def process_job(job_id: str, url: str, clip_length: float, count: int, quality: 
         j["done"] = True
         j["error"] = str(e)
         j["status"] = "Error"
+        # A failed job is never resumed: the UI shows the message and sends the
+        # user back to the input, so whatever it managed to download or upload
+        # would sit on the volume until the next analysis or the next restart.
+        # Nothing is served from a failed job, so it is safe to take back now.
+        # The job entry stays, because the client still has to read the error.
+        purge_job_files(job_id)
 
 # Serve the React build for local runs (must be after all API routes).
 # Skipped on Vercel: the frontend service owns static assets there.

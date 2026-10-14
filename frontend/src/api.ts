@@ -85,6 +85,8 @@ export interface JobStatus {
   done: boolean
   status: string
   pct: number
+  /** Byte/speed/ETA line for the transfer phase, empty once it is over. */
+  detail?: string
   title: string
   moments: Moment[]
   error: string | null
@@ -92,24 +94,67 @@ export interface JobStatus {
   transcripts?: Record<string, Transcript>
 }
 
-export async function analyzeVideo(data: FormData): Promise<{ job: string }> {
-  let res: Response
-  try {
-    res = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: data })
-  } catch (cause) {
+/**
+ * Start an analysis, reporting how much of a local upload has been sent.
+ *
+ * XHR rather than fetch because fetch cannot report upload progress, and a 2 GB
+ * file on a slow uplink is several minutes of nothing happening. The job does
+ * not exist until the body has been posted in full, so this covers the one
+ * stretch of the wait the server knows nothing about.
+ *
+ * The error path is unchanged: the body is handed to describeFailure as a real
+ * Response, so an HTML 404 from a static host still explains itself.
+ */
+export function analyzeVideo(
+  data: FormData,
+  onUploadProgress?: (pct: number) => void,
+): Promise<{ job: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open("POST", `${API_BASE}/api/analyze`)
+
+    xhr.upload.onprogress = (e) => {
+      if (onUploadProgress && e.lengthComputable && e.total > 0) {
+        onUploadProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    }
+
+    xhr.onload = async () => {
+      const body = xhr.responseText ?? ""
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(body))
+        } catch {
+          reject(new Error("The API returned a response that was not JSON."))
+        }
+        return
+      }
+      const headers = new Headers()
+      const type = xhr.getResponseHeader("content-type")
+      if (type) headers.set("content-type", type)
+      reject(
+        new Error(
+          await describeFailure(
+            new Response(body, { status: xhr.status, headers }),
+            "Analysis failed",
+          ),
+        ),
+      )
+    }
+
     // Network-level failure: wrong host, blocked by CORS, or the API is down.
-    throw new Error(
-      `Could not reach the API at ${API_ORIGIN}. Set apiBase in ` +
-        `frontend/public/config.js (or VITE_API_BASE in Vercel), and allow this ` +
-        `site's origin on the backend. (${
-          cause instanceof Error ? cause.message : String(cause)
-        })`,
-    )
-  }
-  if (!res.ok) {
-    throw new Error(await describeFailure(res, "Analysis failed"))
-  }
-  return res.json()
+    xhr.onerror = () =>
+      reject(
+        new Error(
+          `Could not reach the API at ${API_ORIGIN}. Set apiBase in ` +
+            `frontend/public/config.js (or VITE_API_BASE in Vercel), and allow this ` +
+            `site's origin on the backend.`,
+        ),
+      )
+    xhr.onabort = () => reject(new Error("Upload cancelled"))
+
+    xhr.send(data)
+  })
 }
 
 export async function pollJob(jobId: string): Promise<JobStatus> {
