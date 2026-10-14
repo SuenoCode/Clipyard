@@ -117,6 +117,56 @@ def artifact_lock(key):
         return ARTIFACT_LOCKS[key]
 
 
+def sweep_stale_artifacts() -> None:
+    """Delete artifacts left behind by a previous process, at boot.
+
+    DELETE /api/job/{id} only knows about jobs this process started: JOBS lives
+    in memory, so a deploy, crash or restart orphans every source and preview
+    already on the volume, and nothing would ever release them. This is the
+    backstop for that case.
+
+    Age, not job id, is the test, because an orphan cannot be distinguished from
+    a live job by anything on disk. The window is long by default so a restart
+    during a long download does not pull the source out from under it, and 0
+    turns the sweep off.
+    """
+    try:
+        ttl_hours = float(os.environ.get("SKIMREEL_ARTIFACT_TTL_HOURS", "24"))
+    except ValueError:
+        ttl_hours = 24.0
+    if ttl_hours <= 0:
+        return
+
+    cutoff = time.time() - ttl_hours * 3600
+    try:
+        names = os.listdir(DOWNLOAD_DIR)
+    except OSError:
+        return
+
+    removed = 0
+    freed = 0
+    for name in names:
+        path = os.path.join(DOWNLOAD_DIR, name)
+        try:
+            if not os.path.isfile(path) or os.path.getmtime(path) > cutoff:
+                continue
+            freed += os.path.getsize(path)
+            os.remove(path)
+            removed += 1
+        except OSError:
+            continue
+
+    if removed:
+        print(
+            f"[skimreel] startup sweep removed {removed} stale artifact(s), "
+            f"{freed / (1024 * 1024):.0f} MB, older than {ttl_hours:g}h",
+            file=sys.stderr,
+        )
+
+
+sweep_stale_artifacts()
+
+
 def norm_quality(quality: str) -> str:
     """UI sends '1080p'; the format selectors below expect '1080'."""
     q = str(quality or "").strip().lower()
@@ -465,6 +515,55 @@ def get_job(job_id: str):
         "requested_quality": j.get("quality", ""),
         "transcripts": j.get("transcripts", {})
     }
+
+@app.delete("/api/job/{job_id}")
+def delete_job(job_id: str):
+    """Release a finished job's disk artifacts.
+
+    The client calls this when the user starts a new analysis, which is the point
+    at which the previous results are no longer being used. A 1080p source alone
+    runs to hundreds of megabytes and every preview and clip adds to it, so a
+    handful of analyses fills the volume the container mounts.
+
+    Artifacts are matched on the job-id prefix every one of them is named with,
+    which also catches yt-dlp's per-format fragments and .part files that an
+    interrupted download leaves behind - those are never served but they are
+    just as large.
+
+    Only a finished job can be released: a job still running holds a download or
+    an encode open, and deleting its source under a live ffmpeg fails the request
+    instead of reclaiming anything. 409 keeps that visible rather than silently
+    leaking the disk.
+    """
+    j = JOBS.get(job_id)
+    if j is None:
+        # Already released, or the process restarted and lost it. Report success
+        # so the client never blocks a new analysis on cleanup it cannot undo.
+        return {"released": True, "removed": 0}
+    if not j.get("done"):
+        raise HTTPException(status_code=409, detail="Job is still running")
+
+    removed = 0
+    try:
+        names = os.listdir(DOWNLOAD_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        # Job ids are uuids, so no other artifact's name can be a longer id's
+        # prefix - this cannot delete an unrelated file.
+        if not name.startswith(job_id):
+            continue
+        try:
+            os.remove(os.path.join(DOWNLOAD_DIR, name))
+            removed += 1
+        except OSError:
+            # A file still locked by a cloud-sync client is left for the next
+            # sweep rather than failing the release.
+            pass
+
+    JOBS.pop(job_id, None)
+    return {"released": True, "removed": removed}
+
 
 def moment_of(job_id: str, idx: int):
     if job_id not in JOBS or not JOBS[job_id]["done"]:

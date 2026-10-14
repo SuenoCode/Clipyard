@@ -2,7 +2,7 @@ import { useRef, useState, useEffect } from "react"
 import ResultsView from "./ResultsView"
 import LoadingView from "./LoadingView"
 import Icon from "./Icon"
-import { analyzeVideo, pollJob, JobStatus } from "./api"
+import { analyzeVideo, pollJob, releaseJob, JobStatus } from "./api"
 
 const assetPathPrefix = "/assets"
 
@@ -63,6 +63,15 @@ export default function App() {
     setView("loading")
     setError(null)
     setMessage("")
+
+    // The user is starting over, so the previous analysis' downloaded source,
+    // previews and clips are dead weight on the API host. Release them before
+    // the new upload so a large source does not have to share the disk with it.
+    if (jobId) {
+      releaseJob(jobId)
+      setJobId(null)
+      setJobStatus(null)
+    }
 
     const formData = new FormData()
     if (files.length) {

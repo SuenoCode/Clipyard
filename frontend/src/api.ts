@@ -122,9 +122,26 @@ export async function pollJob(jobId: string): Promise<JobStatus> {
   return res.json()
 }
 
+/**
+ * Tell the API the previous job's videos are finished with, so it can delete
+ * them.
+ *
+ * Fire-and-forget by design: a failed release is a disk-space problem, not
+ * something that should stop the user from analysing the next video, and the
+ * API also reclaims leftovers on its own. Never awaited by the caller.
+ */
+export function releaseJob(jobId: string): void {
+  fetch(`${API_BASE}/api/job/${jobId}`, { method: "DELETE", keepalive: true }).catch(
+    () => {
+      /* best effort */
+    },
+  )
+}
+
 export function clipUrl(jobId: string, idx: number): string {
   return `${API_BASE}/api/clip/${jobId}/${idx}`
 }
+
 
 export function previewUrl(jobId: string, idx: number): string {
   return `${API_BASE}/api/preview/${jobId}/${idx}`
